@@ -1,0 +1,32 @@
+# ---- Rust / Cargo ----
+/target/
+**/*.rs.bk
+
+# ---- Cargo lock (binary vs library) ----
+# Keep Cargo.lock for binaries
+# Ignore it for libraries
+# (uncomment the next line IF this is a library crate)
+# Cargo.lock
+
+# ---- Environment files ----
+.env
+.env.*
+
+# ---- Logs ----
+*.log
+
+# ---- OS files ----
+.DS_Store
+Thumbs.db
+
+# ---- Editor / IDE ----
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ---- Coverage / profiling ----
+/coverage/
+/tarpaulin-report.html
+*.profraw
+
