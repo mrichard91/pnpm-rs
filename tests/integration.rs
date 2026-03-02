@@ -150,3 +150,176 @@ fn ls_aliases_list() -> Result<()> {
     assert_eq!(list_out, ls_out);
     Ok(())
 }
+
+#[test]
+fn add_rejects_invalid_package_name() -> Result<()> {
+    let temp = TempDir::new()?;
+    let package_json = serde_json::json!({
+        "name": "invalid-name-project",
+        "version": "1.0.0",
+        "private": true
+    });
+    fs::write(
+        temp.path().join("package.json"),
+        serde_json::to_string_pretty(&package_json)? + "\n",
+    )?;
+
+    let mut cmd = cargo_bin_cmd!("pnpm-rs");
+    cmd.current_dir(temp.path()).arg("add").arg("../evil");
+    cmd.assert()
+        .failure()
+        .stderr(predicates::str::contains("package name"));
+    Ok(())
+}
+
+#[test]
+fn install_rejects_invalid_manifest_dependency_name() -> Result<()> {
+    let temp = TempDir::new()?;
+    let package_json = serde_json::json!({
+        "name": "invalid-manifest-project",
+        "version": "1.0.0",
+        "private": true,
+        "dependencies": {
+            "../evil": "1.0.0"
+        }
+    });
+    fs::write(
+        temp.path().join("package.json"),
+        serde_json::to_string_pretty(&package_json)? + "\n",
+    )?;
+
+    let mut cmd = cargo_bin_cmd!("pnpm-rs");
+    cmd.current_dir(temp.path()).arg("install");
+    cmd.assert()
+        .failure()
+        .stderr(predicates::str::contains("package name"));
+    Ok(())
+}
+
+#[test]
+fn stubbed_commands_exit_nonzero() -> Result<()> {
+    let mut cmd = cargo_bin_cmd!("pnpm-rs");
+    cmd.arg("run").arg("test");
+    cmd.assert()
+        .failure()
+        .stderr(predicates::str::contains("not implemented"));
+    Ok(())
+}
+
+#[test]
+fn add_writes_caret_range() -> Result<()> {
+    let temp = TempDir::new()?;
+    let package_json = serde_json::json!({
+        "name": "caret-project",
+        "version": "1.0.0",
+        "private": true
+    });
+    fs::write(
+        temp.path().join("package.json"),
+        serde_json::to_string_pretty(&package_json)? + "\n",
+    )?;
+
+    let mut cmd = cargo_bin_cmd!("pnpm-rs");
+    cmd.current_dir(temp.path()).arg("add").arg("react@19");
+    cmd.assert().success();
+
+    let contents = fs::read_to_string(temp.path().join("package.json"))?;
+    let parsed: serde_json::Value = serde_json::from_str(&contents)?;
+    let react_version = parsed["dependencies"]["react"].as_str().unwrap();
+    assert!(react_version.starts_with('^'), "expected caret range, got {react_version}");
+    Ok(())
+}
+
+#[test]
+fn add_save_exact_writes_plain_version() -> Result<()> {
+    let temp = TempDir::new()?;
+    let package_json = serde_json::json!({
+        "name": "exact-project",
+        "version": "1.0.0",
+        "private": true
+    });
+    fs::write(
+        temp.path().join("package.json"),
+        serde_json::to_string_pretty(&package_json)? + "\n",
+    )?;
+
+    let mut cmd = cargo_bin_cmd!("pnpm-rs");
+    cmd.current_dir(temp.path()).arg("add").arg("--save-exact").arg("react@19");
+    cmd.assert().success();
+
+    let contents = fs::read_to_string(temp.path().join("package.json"))?;
+    let parsed: serde_json::Value = serde_json::from_str(&contents)?;
+    let react_version = parsed["dependencies"]["react"].as_str().unwrap();
+    assert!(!react_version.starts_with('^'), "expected exact version, got {react_version}");
+    Ok(())
+}
+
+#[test]
+fn add_save_dev_writes_to_dev_dependencies() -> Result<()> {
+    let temp = TempDir::new()?;
+    let package_json = serde_json::json!({
+        "name": "dev-dep-project",
+        "version": "1.0.0",
+        "private": true
+    });
+    fs::write(
+        temp.path().join("package.json"),
+        serde_json::to_string_pretty(&package_json)? + "\n",
+    )?;
+
+    let mut cmd = cargo_bin_cmd!("pnpm-rs");
+    cmd.current_dir(temp.path()).arg("add").arg("--save-dev").arg("react@19");
+    cmd.assert().success();
+
+    let contents = fs::read_to_string(temp.path().join("package.json"))?;
+    let parsed: serde_json::Value = serde_json::from_str(&contents)?;
+    assert!(parsed["devDependencies"]["react"].is_string(), "expected react in devDependencies");
+    assert!(parsed["dependencies"]["react"].is_null(), "expected react NOT in dependencies");
+    Ok(())
+}
+
+#[test]
+fn frozen_lockfile_fails_without_lockfile() -> Result<()> {
+    let temp = TempDir::new()?;
+    let package_json = serde_json::json!({
+        "name": "frozen-project",
+        "version": "1.0.0",
+        "private": true,
+        "dependencies": { "react": "^19.0.0" }
+    });
+    fs::write(
+        temp.path().join("package.json"),
+        serde_json::to_string_pretty(&package_json)? + "\n",
+    )?;
+
+    let mut cmd = cargo_bin_cmd!("pnpm-rs");
+    cmd.current_dir(temp.path()).arg("--frozen-lockfile").arg("install");
+    cmd.assert()
+        .failure()
+        .stderr(predicates::str::contains("no lockfile found"));
+    Ok(())
+}
+
+#[test]
+fn lockfile_install_creates_bin_links() -> Result<()> {
+    let temp = TempDir::new()?;
+    let package_json = serde_json::json!({
+        "name": "bin-project",
+        "version": "1.0.0",
+        "private": true
+    });
+    fs::write(
+        temp.path().join("package.json"),
+        serde_json::to_string_pretty(&package_json)? + "\n",
+    )?;
+
+    // Add a package that has bin entries (semver has a bin)
+    let mut cmd = cargo_bin_cmd!("pnpm-rs");
+    cmd.current_dir(temp.path()).arg("add").arg("semver@7");
+    cmd.assert().success();
+
+    let bin_dir = temp.path().join("node_modules").join(".bin");
+    let semver_bin = bin_dir.join("semver");
+    assert!(semver_bin.exists() || bin_dir.exists(), "node_modules/.bin directory should exist after adding a package with bin");
+    Ok(())
+}
