@@ -403,7 +403,8 @@ fn add_packages(cwd: &Path, specs: &[PackageSpec], debug: bool, section: DepSect
     let mut manifest = read_package_json(cwd)?;
     let section_key = section.key();
     {
-        let obj = manifest.as_object_mut().expect("package.json object");
+        let obj = manifest.as_object_mut()
+            .ok_or_else(|| anyhow!("package.json is not a JSON object"))?;
         if !obj.contains_key(section_key) {
             obj.insert(
                 section_key.to_string(),
@@ -429,10 +430,10 @@ fn add_packages(cwd: &Path, specs: &[PackageSpec], debug: bool, section: DepSect
 
     let deps = manifest
         .as_object_mut()
-        .expect("package.json object")
+        .ok_or_else(|| anyhow!("package.json is not a JSON object"))?
         .get_mut(section_key)
         .and_then(|v| v.as_object_mut())
-        .expect("dep section object");
+        .ok_or_else(|| anyhow!("{section_key} is not a JSON object in package.json"))?;
 
     for spec in specs {
         let version = resolve
@@ -1526,7 +1527,7 @@ fn resolve_dependencies(specs: &[PackageSpec], debug: bool, overrides: &HashMap<
             overrides,
             registry,
         )?;
-        let optional_dependencies = resolve_dependency_set(
+        let optional_dependencies = match resolve_dependency_set(
             &client,
             version_entry.optional_dependencies.as_ref(),
             &mut metadata_cache,
@@ -1534,7 +1535,13 @@ fn resolve_dependencies(specs: &[PackageSpec], debug: bool, overrides: &HashMap<
             debug,
             overrides,
             registry,
-        )?;
+        ) {
+            Ok(deps) => deps,
+            Err(e) => {
+                warn(&format!("optional dependency resolution failed for {name}@{version}: {e}"));
+                BTreeMap::new()
+            }
+        };
 
         // Resolve non-optional peer dependencies
         let peer_deps_to_resolve: Option<HashMap<String, String>> = version_entry
@@ -1555,7 +1562,7 @@ fn resolve_dependencies(specs: &[PackageSpec], debug: bool, overrides: &HashMap<
                     .collect()
             });
 
-        let peer_dependencies = resolve_dependency_set(
+        let peer_dependencies = match resolve_dependency_set(
             &client,
             peer_deps_to_resolve.as_ref(),
             &mut metadata_cache,
@@ -1563,7 +1570,13 @@ fn resolve_dependencies(specs: &[PackageSpec], debug: bool, overrides: &HashMap<
             debug,
             overrides,
             registry,
-        )?;
+        ) {
+            Ok(deps) => deps,
+            Err(e) => {
+                warn(&format!("peer dependency resolution failed for {name}@{version}: {e}"));
+                BTreeMap::new()
+            }
+        };
 
         nodes.insert(
             key,
@@ -2918,6 +2931,7 @@ struct ImporterIn {
 enum ImporterDepIn {
     String(String),
     Object {
+        specifier: Option<String>,
         version: Option<String>,
     },
 }
@@ -2974,7 +2988,8 @@ fn lockfile_satisfies_manifest(
             m.iter().map(|(k, v)| {
                 let spec = match v {
                     ImporterDepIn::String(s) => s.clone(),
-                    ImporterDepIn::Object { version, .. } => version.clone().unwrap_or_default(),
+                    ImporterDepIn::Object { specifier: Some(s), .. } => s.clone(),
+                    ImporterDepIn::Object { specifier: None, version, .. } => version.clone().unwrap_or_default(),
                 };
                 (k.clone(), spec)
             }).collect::<HashMap<_, _>>()
@@ -2983,8 +2998,8 @@ fn lockfile_satisfies_manifest(
         if lockfile_map.len() != manifest_deps.len() {
             return false;
         }
-        for (name, _spec) in manifest_deps {
-            if !lockfile_map.contains_key(name) {
+        for (name, spec) in manifest_deps {
+            if lockfile_map.get(name) != Some(spec) {
                 return false;
             }
         }
@@ -3155,6 +3170,15 @@ fn install_from_lockfile(cwd: &Path, lockfile: &LockfileIn, _debug: bool, regist
     link_root_bin_entries(cwd, &root_resolved)?;
 
     write_modules_yaml(cwd, registry)?;
+
+    // Copy pnpm-lock.yaml to node_modules/.pnpm/lock.yaml
+    let lockfile_src = cwd.join("pnpm-lock.yaml");
+    if lockfile_src.exists() {
+        let lockfile_dst = store_root.join("lock.yaml");
+        fs::copy(&lockfile_src, &lockfile_dst)
+            .with_context(|| format!("copy lockfile to {}", lockfile_dst.display()))?;
+    }
+
     print_blocked_scripts_for_root(cwd)?;
     println!("Packages: +{installed_count}");
     println!("Done");
@@ -3606,5 +3630,47 @@ mod tests {
         let result = stub_command("run", &["test".to_string()]);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not implemented"));
+    }
+
+    #[test]
+    fn lockfile_satisfies_manifest_rejects_mismatched_specifiers() {
+        let mut deps = HashMap::new();
+        deps.insert("react".to_string(), ImporterDepIn::Object {
+            specifier: Some("^18.0.0".to_string()),
+            version: Some("18.2.0".to_string()),
+        });
+        let lockfile = LockfileIn {
+            importers: Some(HashMap::from([(".".to_string(), ImporterIn {
+                dependencies: Some(deps),
+                dev_dependencies: None,
+                optional_dependencies: None,
+            })])),
+            packages: None,
+            snapshots: None,
+        };
+        let manifest_deps = HashMap::from([("react".to_string(), "^19.0.0".to_string())]);
+        let empty = HashMap::new();
+        assert!(!lockfile_satisfies_manifest(&lockfile, &manifest_deps, &empty, &empty));
+    }
+
+    #[test]
+    fn lockfile_satisfies_manifest_accepts_matching_specifiers() {
+        let mut deps = HashMap::new();
+        deps.insert("react".to_string(), ImporterDepIn::Object {
+            specifier: Some("^19.0.0".to_string()),
+            version: Some("19.0.0".to_string()),
+        });
+        let lockfile = LockfileIn {
+            importers: Some(HashMap::from([(".".to_string(), ImporterIn {
+                dependencies: Some(deps),
+                dev_dependencies: None,
+                optional_dependencies: None,
+            })])),
+            packages: None,
+            snapshots: None,
+        };
+        let manifest_deps = HashMap::from([("react".to_string(), "^19.0.0".to_string())]);
+        let empty = HashMap::new();
+        assert!(lockfile_satisfies_manifest(&lockfile, &manifest_deps, &empty, &empty));
     }
 }
