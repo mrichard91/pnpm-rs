@@ -2297,6 +2297,39 @@ fn package_publish_time(
     Ok(Some(parsed))
 }
 
+fn package_modified_time(meta: &RegistryPackage) -> Result<Option<chrono::DateTime<Utc>>> {
+    let Some(times) = &meta.time else {
+        return Ok(None);
+    };
+    let Some(ts) = times.get("modified") else {
+        return Ok(None);
+    };
+    let parsed = chrono::DateTime::parse_from_rfc3339(ts)
+        .with_context(|| format!("parse timestamp {ts}"))?
+        .with_timezone(&Utc);
+    Ok(Some(parsed))
+}
+
+fn print_selected_metadata_summary(name: &str, version: &str, meta: &RegistryPackage) {
+    println!("{}", selected_metadata_summary_line(name, version, meta));
+}
+
+fn selected_metadata_summary_line(name: &str, version: &str, meta: &RegistryPackage) -> String {
+    let version_published = package_publish_time(meta, version)
+        .ok()
+        .flatten()
+        .map(|ts| ts.to_rfc3339())
+        .unwrap_or_else(|| "unknown".to_string());
+    let modified = package_modified_time(meta)
+        .ok()
+        .flatten()
+        .map(|ts| ts.to_rfc3339())
+        .unwrap_or_else(|| "unknown".to_string());
+    format!(
+        "Selected package: {name}@{version} (version published {version_published}; package modified {modified})"
+    )
+}
+
 fn compile_yara_rules(path: &str) -> Result<yara::Rules> {
     let source = fs::read_to_string(path).with_context(|| format!("read yara rules {}", path))?;
     let compiler = Compiler::new().context("initialize yara compiler")?;
@@ -2588,6 +2621,7 @@ fn resolve_dependencies(
             .map(|s| vec![s.clone()])
             .unwrap_or_default();
         let version = select_version(&spec.name, &reqs, &meta, overrides)?;
+        print_selected_metadata_summary(&spec.name, &version, &meta);
         root_resolved.insert(spec.name.clone(), version.clone());
         queue.push_back((spec.name.clone(), version));
     }
@@ -2718,6 +2752,7 @@ fn resolve_top_level_only(
             .map(|s| vec![s.clone()])
             .unwrap_or_default();
         let version = select_version(&spec.name, &reqs, &meta, overrides)?;
+        print_selected_metadata_summary(&spec.name, &version, &meta);
         root_resolved.insert(spec.name.clone(), version);
     }
 
@@ -5057,6 +5092,27 @@ mod tests {
         assert!(node.optional_dependencies.is_empty());
         assert!(node.peer_dependencies.is_empty());
         assert_eq!(resolved.root_resolved.get("react").unwrap(), "19.2.0");
+    }
+
+    #[test]
+    fn selected_metadata_summary_line_includes_publish_and_modified_dates() {
+        let meta = RegistryPackage {
+            versions: HashMap::new(),
+            dist_tags: HashMap::new(),
+            time: Some(HashMap::from([
+                ("19.2.0".to_string(), "2026-03-20T10:11:12.000Z".to_string()),
+                (
+                    "modified".to_string(),
+                    "2026-03-22T13:14:15.000Z".to_string(),
+                ),
+            ])),
+        };
+
+        let line = selected_metadata_summary_line("react", "19.2.0", &meta);
+
+        assert!(line.contains("Selected package: react@19.2.0"));
+        assert!(line.contains("version published 2026-03-20T10:11:12+00:00"));
+        assert!(line.contains("package modified 2026-03-22T13:14:15+00:00"));
     }
 
     #[test]

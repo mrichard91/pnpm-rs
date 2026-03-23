@@ -226,9 +226,42 @@ struct AggregateScanSummary {
     matched_files: Vec<AggregatedMatchLocation>,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum LogKind {
+    Header,
+    Info,
+    Bad,
+    Error,
+}
+
+impl LogKind {
+    fn marker(self) -> &'static str {
+        match self {
+            Self::Header => "[=]",
+            Self::Info => "[+]",
+            Self::Bad => "[-]",
+            Self::Error => "[*]",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct LogEntry {
+    level: usize,
+    kind: LogKind,
+    message: String,
+}
+
+impl LogEntry {
+    fn render(&self) -> String {
+        let indent = "  ".repeat(self.level);
+        format!("{indent}{} {}", self.kind.marker(), self.message)
+    }
+}
+
 #[derive(Debug, Default)]
 struct PackageLog {
-    lines: Vec<String>,
+    entries: Vec<LogEntry>,
 }
 
 impl PackageLog {
@@ -239,23 +272,51 @@ impl PackageLog {
     }
 
     fn header(&mut self, message: &str) {
-        self.lines.push(format!("[=] {message}"));
+        self.header_at(0, message);
+    }
+
+    fn header_at(&mut self, level: usize, message: &str) {
+        self.push(level, LogKind::Header, message);
     }
 
     fn info(&mut self, message: &str) {
-        self.lines.push(format!("  [+] {message}"));
+        self.info_at(1, message);
+    }
+
+    fn info_at(&mut self, level: usize, message: &str) {
+        self.push(level, LogKind::Info, message);
     }
 
     fn bad(&mut self, message: &str) {
-        self.lines.push(format!("  [-] {message}"));
+        self.bad_at(1, message);
+    }
+
+    fn bad_at(&mut self, level: usize, message: &str) {
+        self.push(level, LogKind::Bad, message);
     }
 
     fn error(&mut self, message: &str) {
-        self.lines.push(format!("  [*] {message}"));
+        self.error_at(1, message);
+    }
+
+    fn error_at(&mut self, level: usize, message: &str) {
+        self.push(level, LogKind::Error, message);
+    }
+
+    fn push(&mut self, level: usize, kind: LogKind, message: &str) {
+        self.entries.push(LogEntry {
+            level,
+            kind,
+            message: message.to_string(),
+        });
     }
 
     fn has_output(&self) -> bool {
-        !self.lines.is_empty()
+        !self.entries.is_empty()
+    }
+
+    fn rendered_lines(&self) -> Vec<String> {
+        self.entries.iter().map(LogEntry::render).collect()
     }
 }
 
@@ -752,60 +813,70 @@ fn print_multi_scan_summary(
     yara_enabled: bool,
 ) {
     let summary = aggregate_scan_results(results, failures);
-    println!();
-    println!("[=] summary");
-    println!("  [+] requested target: {requested}");
-    println!(
-        "  [+] package scans completed: {}",
+    let mut log = PackageLog::default();
+    log.header("summary");
+    log.info(&format!("requested target: {requested}"));
+    log.info(&format!(
+        "package scans completed: {}",
         summary.successful_scans
-    );
-    println!("  [+] package scans failed: {}", summary.failed_scans);
-    println!("  [+] packages scanned: {}", summary.packages_scanned);
-    println!(
-        "  [+] workspace importers scanned: {}",
+    ));
+    log.info(&format!("package scans failed: {}", summary.failed_scans));
+    log.info(&format!("packages scanned: {}", summary.packages_scanned));
+    log.info(&format!(
+        "workspace importers scanned: {}",
         summary.workspace_importers_scanned
-    );
-    println!(
-        "  [+] packages with issues: {}",
+    ));
+    log.info(&format!(
+        "packages with issues: {}",
         summary.packages_with_issues
-    );
-    println!("  [+] issues found: {}", summary.issues_found);
+    ));
+    log.info(&format!("issues found: {}", summary.issues_found));
     if !failures.is_empty() {
-        println!("  [*] failed packages:");
+        log.error("failed packages:");
         for failure in failures {
-            println!("    [*] {}: {}", failure.package, failure.error);
+            log.error_at(2, &format!("{}: {}", failure.package, failure.error));
         }
     }
     if !yara_enabled {
-        println!("  [+] YARA enabled: no");
+        log.info("YARA enabled: no");
+        println!();
+        print_package_log(&log);
         return;
     }
-    println!("  [+] YARA files scanned: {}", summary.files_scanned);
-    println!("  [+] YARA rule matches: {}", summary.rule_matches);
-    println!("  [+] YARA string matches: {}", summary.string_matches);
-    println!(
-        "  [+] target packages with YARA matches: {}",
+    log.info(&format!("YARA files scanned: {}", summary.files_scanned));
+    log.info(&format!("YARA rule matches: {}", summary.rule_matches));
+    log.info(&format!("YARA string matches: {}", summary.string_matches));
+    log.info(&format!(
+        "target packages with YARA matches: {}",
         summary.packages_with_matches.len()
-    );
-    println!("  [+] matched files: {}", summary.matched_files.len());
+    ));
+    log.info(&format!("matched files: {}", summary.matched_files.len()));
     if !summary.rules_matched.is_empty() {
-        println!("  [+] matched rules: {}", summary.rules_matched.join(", "));
+        log.info(&format!(
+            "matched rules: {}",
+            summary.rules_matched.join(", ")
+        ));
     }
     if !summary.packages_with_matches.is_empty() {
-        println!("  [-] target packages with YARA matches:");
+        log.bad("target packages with YARA matches:");
         for package in &summary.packages_with_matches {
-            println!("    [-] {package}");
+            log.bad_at(2, package);
         }
     }
     if !summary.matched_files.is_empty() {
-        println!("  [-] matched files:");
+        log.bad("matched files:");
         for entry in &summary.matched_files {
-            println!(
-                "    [-] {} [{}] {} (rule {})",
-                entry.scanned_package, entry.source_package, entry.path, entry.rule
+            log.bad_at(
+                2,
+                &format!(
+                    "{} [{}] {} (rule {})",
+                    entry.scanned_package, entry.source_package, entry.path, entry.rule
+                ),
             );
         }
     }
+    println!();
+    print_package_log(&log);
 }
 
 fn scan_failure_from_log(package: &str, mut log: PackageLog, err: anyhow::Error) -> ScanFailure {
@@ -816,7 +887,7 @@ fn scan_failure_from_log(package: &str, mut log: PackageLog, err: anyhow::Error)
         .unwrap_or("scan failed")
         .to_string();
     for line in rendered.lines().filter(|line| !line.trim().is_empty()) {
-        log.error(line.trim());
+        log.error_at(2, line.trim());
     }
     ScanFailure {
         package: package.to_string(),
@@ -840,7 +911,7 @@ fn print_package_log(log: &PackageLog) {
     if !log.has_output() {
         return;
     }
-    for line in &log.lines {
+    for line in log.rendered_lines() {
         println!("{line}");
     }
 }
@@ -850,50 +921,69 @@ fn emit_command_output(log: &mut PackageLog, step_label: &str, output: &CommandR
         .stdout
         .lines()
         .chain(output.stderr.lines())
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
+        .filter(|line| !line.trim().is_empty())
     {
         classify_command_line(log, step_label, line);
     }
 }
 
-fn classify_command_line(log: &mut PackageLog, step_label: &str, line: &str) {
+fn classify_command_line(log: &mut PackageLog, step_label: &str, raw_line: &str) {
+    let trimmed = raw_line.trim_start();
+    let leading_spaces = raw_line.len().saturating_sub(trimmed.len());
+    let nested_level = 2 + (leading_spaces / 2);
+
     if step_label == "run security scan" {
-        if matches!(
-            line,
-            "Security scan report:" | "YARA summary:" | "No issues detected."
-        ) || line.starts_with("- packages scanned:")
-            || line.starts_with("- workspace importers scanned:")
-            || line.starts_with("- packages with issues:")
-            || line.starts_with("- issues found:")
-            || line.starts_with("- files scanned:")
-            || line.starts_with("- rule matches:")
-            || line.starts_with("- string matches:")
-            || line.starts_with("- rules matched:")
-            || line.starts_with("- packages with matches:")
-            || line.starts_with("- rule list:")
-            || line.starts_with("- target packages with YARA matches:")
-            || line.starts_with("- matched files:")
+        if trimmed == "Security scan report:" || trimmed == "YARA summary:" {
+            log.info_at(nested_level, trimmed);
+            return;
+        }
+        if trimmed == "No issues detected."
+            || trimmed.starts_with("Selected package: ")
+            || trimmed.starts_with("Fetching metadata: ")
         {
-            log.info(line);
+            log.info_at(nested_level, trimmed);
             return;
         }
-        if line.starts_with("warning:") || line.starts_with("warn:") {
-            log.error(line);
+        if let Some(detail) = trimmed.strip_prefix("- ") {
+            let detail_trimmed = detail.trim_start();
+            let detail_spaces = detail.len().saturating_sub(detail_trimmed.len());
+            let detail_level = nested_level + 1 + (detail_spaces / 2);
+            let lower = detail.to_ascii_lowercase();
+            let counts_only = lower.starts_with("packages scanned:")
+                || lower.starts_with("workspace importers scanned:")
+                || lower.starts_with("packages with issues:")
+                || lower.starts_with("issues found:")
+                || lower.starts_with("files scanned:")
+                || lower.starts_with("rule matches:")
+                || lower.starts_with("string matches:")
+                || lower.starts_with("rules matched:")
+                || lower.starts_with("packages with matches:")
+                || lower.starts_with("rule list:")
+                || lower.starts_with("target packages with yara matches:")
+                || lower.starts_with("matched files:");
+            if counts_only {
+                log.info_at(detail_level, detail_trimmed);
+            } else {
+                log.bad_at(detail_level, detail_trimmed);
+            }
             return;
         }
-        log.bad(line);
+        if trimmed.starts_with("warning:") || trimmed.starts_with("warn:") {
+            log.error_at(nested_level, trimmed);
+            return;
+        }
+        log.header_at(nested_level, trimmed);
         return;
     }
 
-    if line.starts_with("warning:") || line.starts_with("warn:") {
-        log.error(line);
-    } else if line.to_ascii_lowercase().contains("blocked")
-        || line.to_ascii_lowercase().contains("lifecycle script")
+    if trimmed.starts_with("warning:") || trimmed.starts_with("warn:") {
+        log.error_at(nested_level, trimmed);
+    } else if trimmed.to_ascii_lowercase().contains("blocked")
+        || trimmed.to_ascii_lowercase().contains("lifecycle script")
     {
-        log.bad(line);
+        log.bad_at(nested_level, trimmed);
     } else {
-        log.info(line);
+        log.info_at(nested_level, trimmed);
     }
 }
 
@@ -926,7 +1016,7 @@ fn run_cmd(
     emit_command_output(log, step_label, &output);
     if !output.status.success() {
         let reason = command_failure_message(step_label, &output);
-        log.error(&reason);
+        log.error_at(2, &reason);
         return Err(anyhow!(reason));
     }
     Ok(())
@@ -986,7 +1076,7 @@ fn run_cmd_dynamic(
     emit_command_output(log, step_label, &output);
     if !output.status.success() {
         let reason = command_failure_message(step_label, &output);
-        log.error(&reason);
+        log.error_at(2, &reason);
         return Err(anyhow!(reason));
     }
     Ok(())
@@ -994,7 +1084,7 @@ fn run_cmd_dynamic(
 
 fn launch_inspection_shell(cwd: &std::path::Path) -> Result<()> {
     println!(
-        "  [+] opening inspection shell in {} (exit the shell to clean up the temp project)",
+        "    [+] opening inspection shell in {} (exit the shell to clean up the temp project)",
         cwd.display()
     );
     let mut cmd = Command::new("/bin/sh");
@@ -1420,6 +1510,57 @@ mod tests {
 
         let yara = summary.yara.unwrap();
         assert_eq!(yara.match_locations[0].path, "node_modules/pkg/index.js");
+    }
+
+    #[test]
+    fn package_log_renders_nested_indentation() {
+        let mut log = PackageLog::scanning("@scope/pkg");
+        log.info("install target package");
+        log.info_at(2, "Selected package: @scope/pkg@1.2.3");
+        log.bad_at(3, "lifecycle script: prepare");
+        assert_eq!(
+            log.rendered_lines(),
+            vec![
+                "[=] scanning @scope/pkg".to_string(),
+                "  [+] install target package".to_string(),
+                "    [+] Selected package: @scope/pkg@1.2.3".to_string(),
+                "      [-] lifecycle script: prepare".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn security_scan_output_classifies_counts_and_findings_at_different_levels() {
+        let mut log = PackageLog::default();
+        super::classify_command_line(
+            &mut log,
+            "run security scan",
+            "Fetching metadata: @scope/pkg",
+        );
+        super::classify_command_line(&mut log, "run security scan", "Security scan report:");
+        super::classify_command_line(&mut log, "run security scan", "- packages scanned: 1");
+        super::classify_command_line(&mut log, "run security scan", "@scope/pkg@1.2.3");
+        super::classify_command_line(
+            &mut log,
+            "run security scan",
+            "- lifecycle script blocked: prepare",
+        );
+        super::classify_command_line(
+            &mut log,
+            "run security scan",
+            "-   starts by invoking the Node.js interpreter",
+        );
+        assert_eq!(
+            log.rendered_lines(),
+            vec![
+                "    [+] Fetching metadata: @scope/pkg".to_string(),
+                "    [+] Security scan report:".to_string(),
+                "      [+] packages scanned: 1".to_string(),
+                "    [=] @scope/pkg@1.2.3".to_string(),
+                "      [-] lifecycle script blocked: prepare".to_string(),
+                "        [-] starts by invoking the Node.js interpreter".to_string(),
+            ]
+        );
     }
 
     #[test]
