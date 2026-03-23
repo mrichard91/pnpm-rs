@@ -2,9 +2,9 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
 use std::io::{self};
-use std::path::{Component, Path, PathBuf};
 #[cfg(unix)]
 use std::os::unix::fs::symlink;
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -12,6 +12,7 @@ use base64::Engine as _;
 use chrono::{Duration as ChronoDuration, Utc};
 use clap::{Parser, Subcommand};
 use flate2::read::GzDecoder;
+use glob::glob;
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -19,13 +20,13 @@ use sha1::{Digest, Sha1};
 use sha2::{Sha256, Sha512};
 use tar::{Archive, EntryType};
 use tempfile::TempDir;
-use glob::glob;
 use yara::Compiler;
 
 const VERSION_STR: &str = "0.1";
 const DEFAULT_REGISTRY: &str = "https://registry.npmjs.org/";
 const MAX_MANIFEST_SIZE: usize = 5 * 1024 * 1024;
 const MAX_PACKAGE_NAME_LEN: usize = 214;
+const MAX_SCRIPT_ANALYSIS_SIZE: usize = 256 * 1024;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -55,6 +56,8 @@ enum Commands {
         save_exact: bool,
         #[arg(long)]
         save_peer: bool,
+        #[arg(long, default_value_t = false)]
+        no_deps: bool,
     },
     Install,
     Remove {
@@ -142,6 +145,8 @@ enum Commands {
         yara: Option<String>,
         #[arg(long, default_value_t = 5)]
         older_than_years: i64,
+        #[arg(long, hide = true)]
+        summary_json: Option<String>,
     },
     #[command(external_subcommand)]
     Other(Vec<String>),
@@ -158,7 +163,15 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Init { name } => init_project(&cwd, name),
-        Commands::Add { packages, save_dev, save_optional, save_exact, save_peer } => {
+        Commands::Add {
+            packages,
+            save_dev,
+            save_optional,
+            save_exact,
+            save_peer,
+            no_deps,
+        } => {
+            ensure_safe_mutation_context(&cwd)?;
             if cli.frozen_lockfile {
                 bail!("pnpm-rs: cannot add packages with --frozen-lockfile");
             }
@@ -178,11 +191,20 @@ fn main() -> Result<()> {
                 .iter()
                 .map(|spec| parse_package_spec(spec))
                 .collect::<Result<Vec<_>>>()?;
-            add_packages(&cwd, &specs, cli.debug, section, save_exact)
+            add_packages(&cwd, &specs, cli.debug, section, save_exact, no_deps)
         }
-        Commands::Install => install_from_manifest(&cwd, cli.debug, cli.frozen_lockfile),
-        Commands::Remove { packages } => remove_packages(&cwd, &packages, cli.debug),
-        Commands::Update { packages } => update_packages(&cwd, &packages, cli.debug),
+        Commands::Install => {
+            ensure_safe_mutation_context(&cwd)?;
+            install_from_manifest(&cwd, cli.debug, cli.frozen_lockfile)
+        }
+        Commands::Remove { packages } => {
+            ensure_safe_mutation_context(&cwd)?;
+            remove_packages(&cwd, &packages, cli.debug)
+        }
+        Commands::Update { packages } => {
+            ensure_safe_mutation_context(&cwd)?;
+            update_packages(&cwd, &packages, cli.debug)
+        }
         Commands::List {
             json,
             long,
@@ -255,13 +277,88 @@ fn main() -> Result<()> {
         Commands::SecurityScan {
             yara,
             older_than_years,
-        } => security_scan(&cwd, cli.debug, yara.as_deref(), older_than_years),
+            summary_json,
+        } => security_scan(
+            &cwd,
+            cli.debug,
+            yara.as_deref(),
+            older_than_years,
+            summary_json.as_deref(),
+        ),
         Commands::Other(args) => stub_command("unknown", &args),
     }
 }
 
 fn has_version_flag() -> bool {
     env::args().any(|arg| arg == "-v" || arg == "--version")
+}
+
+#[derive(Clone, Debug)]
+struct ProjectContext {
+    workspace_root: PathBuf,
+    importer: String,
+    in_workspace: bool,
+}
+
+fn project_context(cwd: &Path) -> Result<ProjectContext> {
+    if let Some(workspace_root) = find_workspace_root(cwd) {
+        let importer = workspace_importer_name(&workspace_root, cwd)?;
+        return Ok(ProjectContext {
+            workspace_root,
+            importer,
+            in_workspace: true,
+        });
+    }
+
+    Ok(ProjectContext {
+        workspace_root: cwd.to_path_buf(),
+        importer: ".".to_string(),
+        in_workspace: false,
+    })
+}
+
+fn workspace_importer_name(workspace_root: &Path, project_dir: &Path) -> Result<String> {
+    if workspace_root == project_dir {
+        return Ok(".".to_string());
+    }
+
+    let relative = project_dir.strip_prefix(workspace_root).with_context(|| {
+        format!(
+            "project {} is outside workspace {}",
+            project_dir.display(),
+            workspace_root.display()
+        )
+    })?;
+
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(part) => parts.push(part.to_string_lossy().to_string()),
+            Component::CurDir => {}
+            _ => {
+                bail!(
+                    "unsupported workspace importer path: {}",
+                    project_dir.display()
+                )
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        Ok(".".to_string())
+    } else {
+        Ok(parts.join("/"))
+    }
+}
+
+fn ensure_safe_mutation_context(cwd: &Path) -> Result<()> {
+    let ctx = project_context(cwd)?;
+    if ctx.in_workspace {
+        bail!(
+            "pnpm-rs safe mode: mutating commands are disabled inside pnpm workspaces; use read-only commands such as list, why, or security-scan"
+        );
+    }
+    Ok(())
 }
 
 fn stub_command(name: &str, args: &[String]) -> Result<()> {
@@ -397,13 +494,24 @@ impl DepSection {
     }
 }
 
-fn add_packages(cwd: &Path, specs: &[PackageSpec], debug: bool, section: DepSection, save_exact: bool) -> Result<()> {
+fn add_packages(
+    cwd: &Path,
+    specs: &[PackageSpec],
+    debug: bool,
+    section: DepSection,
+    save_exact: bool,
+    no_deps: bool,
+) -> Result<()> {
     ensure_project_initialized(cwd, None)?;
     let registry = resolve_registry(cwd)?;
     let mut manifest = read_package_json(cwd)?;
+    if no_deps {
+        ensure_isolated_no_deps_manifest(&manifest, specs, section)?;
+    }
     let section_key = section.key();
     {
-        let obj = manifest.as_object_mut()
+        let obj = manifest
+            .as_object_mut()
             .ok_or_else(|| anyhow!("package.json is not a JSON object"))?;
         if !obj.contains_key(section_key) {
             obj.insert(
@@ -413,20 +521,27 @@ fn add_packages(cwd: &Path, specs: &[PackageSpec], debug: bool, section: DepSect
         }
     }
 
-    let (existing_deps, existing_dev, existing_optional) = collect_manifest_deps(&manifest);
-    let mut root_specs = Vec::new();
-    for (name, req) in existing_deps.iter().chain(existing_dev.iter()).chain(existing_optional.iter()) {
-        root_specs.push(PackageSpec {
-            name: name.clone(),
-            requested: Some(req.clone()),
-        });
-    }
-    for spec in specs {
-        root_specs.push(spec.clone());
-    }
-
     let overrides = read_overrides(&manifest);
-    let resolve = resolve_dependencies(&root_specs, debug, &overrides, &registry)?;
+    let resolve = if no_deps {
+        resolve_top_level_only(specs, debug, &overrides, &registry)?
+    } else {
+        let (existing_deps, existing_dev, existing_optional) = collect_manifest_deps(&manifest);
+        let mut root_specs = Vec::new();
+        for (name, req) in existing_deps
+            .iter()
+            .chain(existing_dev.iter())
+            .chain(existing_optional.iter())
+        {
+            root_specs.push(PackageSpec {
+                name: name.clone(),
+                requested: Some(req.clone()),
+            });
+        }
+        for spec in specs {
+            root_specs.push(spec.clone());
+        }
+        resolve_dependencies(&root_specs, debug, &overrides, &registry)?
+    };
 
     let deps = manifest
         .as_object_mut()
@@ -448,6 +563,42 @@ fn add_packages(cwd: &Path, specs: &[PackageSpec], debug: bool, section: DepSect
     install_with_resolution(cwd, &resolve, debug, &registry)
 }
 
+fn ensure_isolated_no_deps_manifest(
+    manifest: &JsonValue,
+    specs: &[PackageSpec],
+    section: DepSection,
+) -> Result<()> {
+    let allowed: HashSet<&str> = specs.iter().map(|spec| spec.name.as_str()).collect();
+    let mut conflicts = Vec::new();
+
+    for field in [
+        "dependencies",
+        "devDependencies",
+        "optionalDependencies",
+        "peerDependencies",
+    ] {
+        let Some(map) = manifest.get(field).and_then(|value| value.as_object()) else {
+            continue;
+        };
+        for name in map.keys() {
+            let allowed_here = field == section.key() && allowed.contains(name.as_str());
+            if !allowed_here {
+                conflicts.push(format!("{field}.{name}"));
+            }
+        }
+    }
+
+    if conflicts.is_empty() {
+        return Ok(());
+    }
+
+    conflicts.sort();
+    bail!(
+        "pnpm-rs: --no-deps only supports isolated analysis projects; existing root dependencies would be left unresolved: {}",
+        conflicts.join(", ")
+    )
+}
+
 #[derive(Default)]
 struct ScanIssue {
     name: String,
@@ -462,6 +613,40 @@ struct YaraSummary {
     string_matches: usize,
     rules: HashSet<String>,
     packages_with_matches: HashSet<String>,
+    match_locations: Vec<YaraMatchLocation>,
+}
+
+#[derive(Clone, Debug)]
+struct YaraMatchLocation {
+    package: String,
+    rule: String,
+    path: PathBuf,
+}
+
+#[derive(Serialize)]
+struct SecurityScanSummary {
+    packages_scanned: usize,
+    workspace_importers_scanned: usize,
+    packages_with_issues: usize,
+    issues_found: usize,
+    yara: Option<SecurityScanYaraSummary>,
+}
+
+#[derive(Serialize)]
+struct SecurityScanYaraSummary {
+    files_scanned: usize,
+    rule_matches: usize,
+    string_matches: usize,
+    rules: Vec<String>,
+    packages_with_matches: Vec<String>,
+    match_locations: Vec<SecurityScanYaraMatchLocation>,
+}
+
+#[derive(Serialize)]
+struct SecurityScanYaraMatchLocation {
+    package: String,
+    rule: String,
+    path: String,
 }
 
 fn security_scan(
@@ -469,22 +654,38 @@ fn security_scan(
     debug: bool,
     yara_rules_path: Option<&str>,
     older_than_years: i64,
+    summary_json_path: Option<&str>,
 ) -> Result<()> {
-    let lockfile_path = cwd.join("pnpm-lock.yaml");
-    if !lockfile_path.exists() {
-        bail!("pnpm-lock.yaml not found; run pnpm-rs install first");
-    }
-
-    let raw = fs::read_to_string(&lockfile_path)
-        .with_context(|| format!("read {}", lockfile_path.display()))?;
-    let lockfile: LockfileIn = serde_yaml::from_str(&raw).context("parse pnpm-lock.yaml")?;
-    let packages = match &lockfile.packages {
-        Some(packages) if !packages.is_empty() => packages,
-        _ => {
-            println!("Security scan: no packages found in lockfile");
-            return Ok(());
-        }
+    let ctx = project_context(cwd)?;
+    let scan_root = &ctx.workspace_root;
+    let lockfile_path = scan_root.join("pnpm-lock.yaml");
+    let lockfile = if lockfile_path.exists() {
+        let raw = fs::read_to_string(&lockfile_path)
+            .with_context(|| format!("read {}", lockfile_path.display()))?;
+        Some(serde_yaml::from_str::<LockfileIn>(&raw).context("parse pnpm-lock.yaml")?)
+    } else {
+        None
     };
+    let mut package_keys = Vec::new();
+    if let Some(lockfile) = &lockfile {
+        if let Some(packages) = &lockfile.packages {
+            for key in packages.keys() {
+                package_keys.push(key.clone());
+            }
+        }
+        if package_keys.is_empty() {
+            if let Some(snapshots) = &lockfile.snapshots {
+                for key in snapshots.keys() {
+                    package_keys.push(key.clone());
+                }
+            }
+        }
+    } else {
+        warn(&format!(
+            "pnpm-lock.yaml not found in {}; scanning workspace manifests only",
+            scan_root.display()
+        ));
+    }
 
     let mut findings: Vec<ScanIssue> = Vec::new();
     let mut metadata_cache: HashMap<String, RegistryPackage> = HashMap::new();
@@ -492,6 +693,7 @@ fn security_scan(
         .timeout(std::time::Duration::from_secs(60))
         .build()
         .context("build http client")?;
+    let registry = resolve_registry(scan_root)?;
     let cutoff = Utc::now() - ChronoDuration::days(365 * older_than_years);
     let yara_rules = if let Some(path) = yara_rules_path {
         Some(compile_yara_rules(path)?)
@@ -499,19 +701,118 @@ fn security_scan(
         None
     };
     let mut yara_summary = YaraSummary::default();
+    let projects = if ctx.in_workspace {
+        workspace_project_dirs(scan_root)?
+    } else {
+        vec![cwd.to_path_buf()]
+    };
+    let mut importers_scanned = 0;
 
-    for (key, _snapshot) in packages {
-        let Some((name, version)) = parse_lockfile_key(key) else { continue };
+    for project_dir in projects {
+        let manifest_path = project_dir.join("package.json");
+        if !manifest_path.exists() {
+            continue;
+        }
+        importers_scanned += 1;
+        let importer = if ctx.in_workspace {
+            workspace_importer_name(scan_root, &project_dir)?
+        } else {
+            ".".to_string()
+        };
+        match read_json_file(&manifest_path) {
+            Ok(json) => {
+                let display_name = json
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("workspace-importer");
+                let display_version = json
+                    .get("version")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("workspace");
+                let issue_name = if importer == "." {
+                    display_name.to_string()
+                } else {
+                    format!("{display_name} [{importer}]")
+                };
+                let mut issue = ScanIssue {
+                    name: issue_name,
+                    version: display_version.to_string(),
+                    details: Vec::new(),
+                };
+                scan_package_json(&json, &mut issue, Some(&project_dir));
+                if let Some(rules) = &yara_rules {
+                    let package_label = format!("workspace:{importer}");
+                    match scan_with_yara_filtered(
+                        rules,
+                        &project_dir,
+                        Some(&package_label),
+                        &["node_modules", ".git", "target"],
+                    ) {
+                        Ok(result) => {
+                            yara_summary.files_scanned += result.files_scanned;
+                            yara_summary.rule_matches += result.rule_matches;
+                            yara_summary.string_matches += result.string_matches;
+                            if !result.matches.is_empty() {
+                                yara_summary
+                                    .packages_with_matches
+                                    .insert(package_label.clone());
+                            }
+                            for match_detail in result.matches {
+                                yara_summary.rules.insert(match_detail.rule.clone());
+                                yara_summary.match_locations.push(YaraMatchLocation {
+                                    package: package_label.clone(),
+                                    rule: match_detail.rule.clone(),
+                                    path: match_detail.path.clone(),
+                                });
+                                issue.details.push(format!(
+                                    "yara match {} in {}",
+                                    match_detail.rule,
+                                    match_detail.path.display()
+                                ));
+                                if !match_detail.tags.is_empty() {
+                                    issue
+                                        .details
+                                        .push(format!("  tags: {}", match_detail.tags.join(", ")));
+                                }
+                                for line in match_detail.strings {
+                                    issue.details.push(format!("  {line}"));
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            issue.details.push(format!("yara scan error: {err}"));
+                        }
+                    }
+                }
+                if !issue.details.is_empty() {
+                    findings.push(issue);
+                }
+            }
+            Err(err) => {
+                findings.push(ScanIssue {
+                    name: format!("workspace importer [{importer}]"),
+                    version: "workspace".to_string(),
+                    details: vec![format!("missing or unreadable package.json: {err}")],
+                });
+            }
+        }
+    }
+
+    for key in &package_keys {
+        let Some((name, version)) = parse_lockfile_key(key) else {
+            continue;
+        };
         let mut issue = ScanIssue {
             name: name.clone(),
             version: version.clone(),
             details: Vec::new(),
         };
 
-        let install_path = store_package_path(cwd, &name, &version).join("package.json");
+        let install_path =
+            locate_store_package_path(scan_root, &name, &version).join("package.json");
         match read_json_file(&install_path) {
             Ok(json) => {
-                scan_package_json(&json, &mut issue);
+                scan_package_json(&json, &mut issue, install_path.parent());
             }
             Err(err) => {
                 issue
@@ -520,7 +821,7 @@ fn security_scan(
             }
         }
 
-        match fetch_registry_metadata(&client, &name, &mut metadata_cache, debug, DEFAULT_REGISTRY) {
+        match fetch_registry_metadata(&client, &name, &mut metadata_cache, debug, &registry) {
             Ok(meta) => {
                 if !meta.versions.contains_key(&version) {
                     issue
@@ -530,7 +831,7 @@ fn security_scan(
                 match package_publish_time(&meta, &version) {
                     Ok(Some(ts)) => {
                         if ts < cutoff {
-                        issue.details.push(format!(
+                            issue.details.push(format!(
                             "package version older than {older_than_years} years (published {})",
                             ts.to_rfc3339()
                         ));
@@ -556,7 +857,7 @@ fn security_scan(
         }
 
         if let Some(rules) = &yara_rules {
-            let package_root = store_package_path(cwd, &name, &version);
+            let package_root = locate_store_package_path(scan_root, &name, &version);
             let package_label = format!("{name}@{version}");
             match scan_with_yara(rules, &package_root, Some(&package_label)) {
                 Ok(result) => {
@@ -570,9 +871,16 @@ fn security_scan(
                     }
                     for match_detail in result.matches {
                         yara_summary.rules.insert(match_detail.rule.clone());
-                        issue
-                            .details
-                            .push(format!("yara match {} in {}", match_detail.rule, match_detail.path.display()));
+                        yara_summary.match_locations.push(YaraMatchLocation {
+                            package: package_label.clone(),
+                            rule: match_detail.rule.clone(),
+                            path: match_detail.path.clone(),
+                        });
+                        issue.details.push(format!(
+                            "yara match {} in {}",
+                            match_detail.rule,
+                            match_detail.path.display()
+                        ));
                         if !match_detail.tags.is_empty() {
                             issue
                                 .details
@@ -584,9 +892,7 @@ fn security_scan(
                     }
                 }
                 Err(err) => {
-                    issue
-                        .details
-                        .push(format!("yara scan error: {err}"));
+                    issue.details.push(format!("yara scan error: {err}"));
                 }
             }
         }
@@ -596,9 +902,73 @@ fn security_scan(
         }
     }
 
-    print_security_report(&findings, packages.len());
+    let summary = build_security_scan_summary(
+        &findings,
+        package_keys.len(),
+        importers_scanned,
+        yara_rules_path.is_some(),
+        &yara_summary,
+    );
+    if let Some(path) = summary_json_path {
+        write_security_scan_summary(path, &summary)?;
+    }
+    print_security_report(&findings, package_keys.len(), importers_scanned);
     print_yara_summary(&yara_summary, yara_rules_path.is_some());
     Ok(())
+}
+
+fn build_security_scan_summary(
+    findings: &[ScanIssue],
+    packages_scanned: usize,
+    workspace_importers_scanned: usize,
+    yara_enabled: bool,
+    yara_summary: &YaraSummary,
+) -> SecurityScanSummary {
+    SecurityScanSummary {
+        packages_scanned,
+        workspace_importers_scanned,
+        packages_with_issues: findings.len(),
+        issues_found: issue_count(findings),
+        yara: yara_enabled.then(|| {
+            let mut rules: Vec<_> = yara_summary.rules.iter().cloned().collect();
+            rules.sort();
+            let mut packages_with_matches: Vec<_> =
+                yara_summary.packages_with_matches.iter().cloned().collect();
+            packages_with_matches.sort();
+            let mut match_locations = yara_summary
+                .match_locations
+                .iter()
+                .map(|entry| SecurityScanYaraMatchLocation {
+                    package: entry.package.clone(),
+                    rule: entry.rule.clone(),
+                    path: entry.path.display().to_string(),
+                })
+                .collect::<Vec<_>>();
+            match_locations.sort_by(|left, right| {
+                left.package
+                    .cmp(&right.package)
+                    .then(left.path.cmp(&right.path))
+                    .then(left.rule.cmp(&right.rule))
+            });
+            SecurityScanYaraSummary {
+                files_scanned: yara_summary.files_scanned,
+                rule_matches: yara_summary.rule_matches,
+                string_matches: yara_summary.string_matches,
+                rules,
+                packages_with_matches,
+                match_locations,
+            }
+        }),
+    }
+}
+
+fn write_security_scan_summary(path: &str, summary: &SecurityScanSummary) -> Result<()> {
+    let path = Path::new(path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let payload = serde_json::to_vec_pretty(summary).context("serialize security scan summary")?;
+    fs::write(path, payload).with_context(|| format!("write {}", path.display()))
 }
 
 fn install_from_manifest(cwd: &Path, debug: bool, frozen_lockfile: bool) -> Result<()> {
@@ -621,7 +991,11 @@ fn install_from_manifest(cwd: &Path, debug: bool, frozen_lockfile: bool) -> Resu
 
     let overrides = read_overrides(&manifest);
     let mut root_specs = Vec::new();
-    for (name, req) in deps.iter().chain(dev_deps.iter()).chain(optional_deps.iter()) {
+    for (name, req) in deps
+        .iter()
+        .chain(dev_deps.iter())
+        .chain(optional_deps.iter())
+    {
         root_specs.push(PackageSpec {
             name: name.clone(),
             requested: Some(req.clone()),
@@ -634,13 +1008,15 @@ fn install_from_manifest(cwd: &Path, debug: bool, frozen_lockfile: bool) -> Resu
 fn remove_packages(cwd: &Path, packages: &[String], debug: bool) -> Result<()> {
     ensure_project_initialized(cwd, None)?;
     let mut manifest = read_package_json(cwd)?;
-    if let Some(deps) = manifest.get_mut("dependencies").and_then(|v| v.as_object_mut()) {
+    if let Some(deps) = manifest
+        .get_mut("dependencies")
+        .and_then(|v| v.as_object_mut())
+    {
         for name in packages {
             deps.remove(name);
             let path = cwd.join("node_modules").join(name);
             if path.exists() {
-                fs::remove_dir_all(&path)
-                    .with_context(|| format!("remove {}", path.display()))?;
+                fs::remove_dir_all(&path).with_context(|| format!("remove {}", path.display()))?;
             }
         }
     }
@@ -665,7 +1041,7 @@ fn update_packages(cwd: &Path, packages: &[String], debug: bool) -> Result<()> {
             requested: existing.or(Some("latest".to_string())),
         });
     }
-    add_packages(cwd, &specs, debug, DepSection::Dependencies, false)
+    add_packages(cwd, &specs, debug, DepSection::Dependencies, false, false)
 }
 
 struct ListOptions {
@@ -697,13 +1073,11 @@ fn list_packages(cwd: &Path, opts: &ListOptions) -> Result<()> {
     }
 
     let roots = if opts.recursive {
-        let mut dirs = Vec::new();
         if let Some(workspace_root) = find_workspace_root(cwd) {
-            collect_workspace_dirs(&workspace_root, &mut dirs)?;
+            workspace_project_dirs(&workspace_root)?
         } else {
-            dirs.push(cwd.to_path_buf());
+            vec![cwd.to_path_buf()]
         }
-        dirs
     } else {
         vec![cwd.to_path_buf()]
     };
@@ -729,7 +1103,8 @@ fn list_single_project(cwd: &Path, opts: &ListOptions) -> Result<()> {
         return Ok(());
     }
 
-    let lockfile_path = cwd.join("pnpm-lock.yaml");
+    let ctx = project_context(cwd)?;
+    let lockfile_path = ctx.workspace_root.join("pnpm-lock.yaml");
     let lockfile = if lockfile_path.exists() {
         let raw = fs::read_to_string(&lockfile_path)
             .with_context(|| format!("read {}", lockfile_path.display()))?;
@@ -740,7 +1115,11 @@ fn list_single_project(cwd: &Path, opts: &ListOptions) -> Result<()> {
 
     let package_index = lockfile
         .as_ref()
-        .and_then(|lf| lf.snapshots.as_ref().map(build_package_index_from_snapshots))
+        .and_then(|lf| {
+            lf.snapshots
+                .as_ref()
+                .map(build_package_index_from_snapshots)
+        })
         .or_else(|| {
             lockfile
                 .as_ref()
@@ -779,13 +1158,28 @@ fn list_single_project(cwd: &Path, opts: &ListOptions) -> Result<()> {
     Ok(())
 }
 
-fn collect_requested_deps(manifest: &JsonValue, opts: &ListOptions) -> Result<Vec<(String, String)>> {
+fn collect_requested_deps(
+    manifest: &JsonValue,
+    opts: &ListOptions,
+) -> Result<Vec<(String, String)>> {
     let mut result = Vec::new();
     let only = opts.only.as_deref();
     let no_filter = !opts.prod && !opts.dev && !opts.optional && only.is_none();
-    let include_prod = if no_filter { true } else { only.map_or(opts.prod, |v| v == "prod" || v == "production") };
-    let include_dev = if no_filter { true } else { only.map_or(opts.dev, |v| v == "dev" || v == "development") };
-    let include_optional = if no_filter { true } else { only.map_or(opts.optional, |v| v == "optional") };
+    let include_prod = if no_filter {
+        true
+    } else {
+        only.map_or(opts.prod, |v| v == "prod" || v == "production")
+    };
+    let include_dev = if no_filter {
+        true
+    } else {
+        only.map_or(opts.dev, |v| v == "dev" || v == "development")
+    };
+    let include_optional = if no_filter {
+        true
+    } else {
+        only.map_or(opts.optional, |v| v == "optional")
+    };
 
     if include_prod {
         if let Some(deps) = manifest.get("dependencies").and_then(|v| v.as_object()) {
@@ -804,7 +1198,10 @@ fn collect_requested_deps(manifest: &JsonValue, opts: &ListOptions) -> Result<Ve
         }
     }
     if include_optional {
-        if let Some(deps) = manifest.get("optionalDependencies").and_then(|v| v.as_object()) {
+        if let Some(deps) = manifest
+            .get("optionalDependencies")
+            .and_then(|v| v.as_object())
+        {
             for (name, version) in deps {
                 let req = version.as_str().unwrap_or("*");
                 result.push((name.clone(), req.to_string()));
@@ -826,7 +1223,9 @@ fn parse_depth(raw: Option<&str>) -> Result<usize> {
     }
 }
 
-fn build_package_index_from_packages(packages: &HashMap<String, PackageSnapshotIn>) -> PackageIndex {
+fn build_package_index_from_packages(
+    packages: &HashMap<String, PackageSnapshotIn>,
+) -> PackageIndex {
     let mut by_name = HashMap::new();
     let mut by_key = HashMap::new();
     for (key, snapshot) in packages {
@@ -877,7 +1276,10 @@ fn insert_package_index(
     label: &str,
 ) {
     if let Some((name, version)) = parse_lockfile_key(key) {
-        by_name.entry(name.clone()).or_default().push(version.clone());
+        by_name
+            .entry(name.clone())
+            .or_default()
+            .push(version.clone());
         let normalized_key = format!("{name}@{version}");
         if !by_key.contains_key(&normalized_key) {
             by_key.insert(normalized_key, deps);
@@ -903,7 +1305,10 @@ fn resolve_version_for_list(name: &str, req: &str, index: &PackageIndex) -> Stri
 
     let base_req = req.split('(').next().unwrap_or(req).trim();
     let lower_req = base_req.to_ascii_lowercase();
-    if lower_req.starts_with("link:") || lower_req.starts_with("file:") || lower_req.starts_with("workspace:") {
+    if lower_req.starts_with("link:")
+        || lower_req.starts_with("file:")
+        || lower_req.starts_with("workspace:")
+    {
         return base_req.to_string();
     }
     if versions.contains(&base_req.to_string()) {
@@ -919,7 +1324,9 @@ fn resolve_version_for_list(name: &str, req: &str, index: &PackageIndex) -> Stri
                 continue;
             }
         };
-        let Ok(range) = VersionReq::parse(&normalized) else { continue };
+        let Ok(range) = VersionReq::parse(&normalized) else {
+            continue;
+        };
         let mut best: Option<Version> = None;
         for v in versions {
             if let Ok(ver) = Version::parse(v) {
@@ -934,7 +1341,11 @@ fn resolve_version_for_list(name: &str, req: &str, index: &PackageIndex) -> Stri
             return best.to_string();
         }
     }
-    versions.iter().max().cloned().unwrap_or_else(|| "<missing>".to_string())
+    versions
+        .iter()
+        .max()
+        .cloned()
+        .unwrap_or_else(|| "<missing>".to_string())
 }
 
 fn build_list_node(
@@ -957,7 +1368,7 @@ fn build_list_node(
         return node;
     }
 
-        let key = format!("{name}@{version}");
+    let key = format!("{name}@{version}");
     if let Some(deps) = index.by_key.get(&key) {
         for (dep, req) in deps {
             let dep_version = resolve_version_for_list(dep, req, index);
@@ -993,7 +1404,8 @@ fn collect_workspace_dirs(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     }
     let raw = fs::read_to_string(&workspace_file)
         .with_context(|| format!("read {}", workspace_file.display()))?;
-    let yaml: serde_yaml::Value = serde_yaml::from_str(&raw).context("parse pnpm-workspace.yaml")?;
+    let yaml: serde_yaml::Value =
+        serde_yaml::from_str(&raw).context("parse pnpm-workspace.yaml")?;
     let patterns = yaml
         .get("packages")
         .and_then(|value| value.as_sequence())
@@ -1004,7 +1416,9 @@ fn collect_workspace_dirs(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
         return Ok(());
     }
     for pattern in patterns {
-        let Some(pattern_str) = pattern.as_str() else { continue };
+        let Some(pattern_str) = pattern.as_str() else {
+            continue;
+        };
         let joined = root.join(pattern_str);
         let joined_str = joined.to_string_lossy().to_string();
         for entry in glob(&joined_str).with_context(|| format!("glob {}", joined_str))? {
@@ -1015,6 +1429,17 @@ fn collect_workspace_dirs(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn workspace_project_dirs(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut dirs = Vec::new();
+    if root.join("package.json").exists() {
+        dirs.push(root.to_path_buf());
+    }
+    collect_workspace_dirs(root, &mut dirs)?;
+    dirs.sort();
+    dirs.dedup();
+    Ok(dirs)
 }
 
 fn find_workspace_root(start: &Path) -> Option<PathBuf> {
@@ -1041,8 +1466,7 @@ fn read_package_json(cwd: &Path) -> Result<JsonValue> {
 }
 
 fn read_json_file(path: &Path) -> Result<JsonValue> {
-    let raw = fs::read_to_string(path)
-        .with_context(|| format!("read {}", path.display()))?;
+    let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     if raw.len() > MAX_MANIFEST_SIZE {
         bail!("file too large");
     }
@@ -1066,8 +1490,7 @@ fn parse_npmrc(cwd: &Path) -> Result<Option<String>> {
         if !path.exists() {
             continue;
         }
-        let raw = fs::read_to_string(path)
-            .with_context(|| format!("read {}", path.display()))?;
+        let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
         for line in raw.lines() {
             let trimmed = line.trim();
             if trimmed.starts_with('#') || trimmed.starts_with(';') {
@@ -1105,7 +1528,9 @@ fn resolve_registry(cwd: &Path) -> Result<String> {
 }
 
 fn registry_host(registry: &str) -> Option<String> {
-    reqwest::Url::parse(registry).ok().and_then(|u| u.host_str().map(|s| s.to_string()))
+    reqwest::Url::parse(registry)
+        .ok()
+        .and_then(|u| u.host_str().map(|s| s.to_string()))
 }
 
 fn custom_registry_host(registry: &str) -> Option<String> {
@@ -1118,7 +1543,11 @@ fn custom_registry_host(registry: &str) -> Option<String> {
 
 fn collect_manifest_deps(
     manifest: &JsonValue,
-) -> (HashMap<String, String>, HashMap<String, String>, HashMap<String, String>) {
+) -> (
+    HashMap<String, String>,
+    HashMap<String, String>,
+    HashMap<String, String>,
+) {
     let mut deps = HashMap::new();
     let mut dev_deps = HashMap::new();
     let mut optional_deps = HashMap::new();
@@ -1132,7 +1561,10 @@ fn collect_manifest_deps(
             dev_deps.insert(name.clone(), version.as_str().unwrap_or("*").to_string());
         }
     }
-    if let Some(obj) = manifest.get("optionalDependencies").and_then(|v| v.as_object()) {
+    if let Some(obj) = manifest
+        .get("optionalDependencies")
+        .and_then(|v| v.as_object())
+    {
         for (name, version) in obj {
             optional_deps.insert(name.clone(), version.as_str().unwrap_or("*").to_string());
         }
@@ -1140,11 +1572,13 @@ fn collect_manifest_deps(
     (deps, dev_deps, optional_deps)
 }
 
-fn scan_package_json(json: &JsonValue, issue: &mut ScanIssue) {
+fn scan_package_json(json: &JsonValue, issue: &mut ScanIssue, package_dir: Option<&Path>) {
     let obj = match json.as_object() {
         Some(obj) => obj,
         None => {
-            issue.details.push("package.json is not an object".to_string());
+            issue
+                .details
+                .push("package.json is not an object".to_string());
             return;
         }
     };
@@ -1153,9 +1587,10 @@ fn scan_package_json(json: &JsonValue, issue: &mut ScanIssue) {
         if let Some(map) = scripts.as_object() {
             for key in ["preinstall", "install", "postinstall", "prepare"] {
                 if let Some(cmd) = map.get(key).and_then(|v| v.as_str()) {
-                    issue
-                        .details
-                        .push(format!("lifecycle script {key}: {cmd}"));
+                    issue.details.push(format!("lifecycle script {key}: {cmd}"));
+                    for detail in describe_lifecycle_script(obj, cmd, package_dir) {
+                        issue.details.push(format!("  {detail}"));
+                    }
                 } else if map.contains_key(key) {
                     issue
                         .details
@@ -1163,7 +1598,9 @@ fn scan_package_json(json: &JsonValue, issue: &mut ScanIssue) {
                 }
             }
         } else {
-            issue.details.push("scripts field is not an object".to_string());
+            issue
+                .details
+                .push("scripts field is not an object".to_string());
         }
     }
 
@@ -1193,16 +1630,16 @@ fn scan_package_json(json: &JsonValue, issue: &mut ScanIssue) {
                         let req = match req_val.as_str() {
                             Some(req) => req,
                             None => {
-                                issue.details.push(format!(
-                                    "{field} entry {dep} has non-string version"
-                                ));
+                                issue
+                                    .details
+                                    .push(format!("{field} entry {dep} has non-string version"));
                                 continue;
                             }
                         };
                         if is_exotic_requirement(req) {
-                            issue.details.push(format!(
-                                "exotic dependency spec in {field}: {dep}@{req}"
-                            ));
+                            issue
+                                .details
+                                .push(format!("exotic dependency spec in {field}: {dep}@{req}"));
                         }
                     }
                 }
@@ -1216,6 +1653,624 @@ fn scan_package_json(json: &JsonValue, issue: &mut ScanIssue) {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScriptInvocation {
+    command: String,
+    tokens: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CommandProvider {
+    package_name: String,
+    section: &'static str,
+    description: Option<String>,
+    bin_target: Option<String>,
+    bin_names: Vec<String>,
+}
+
+fn describe_lifecycle_script(
+    manifest: &serde_json::Map<String, JsonValue>,
+    cmd: &str,
+    package_dir: Option<&Path>,
+) -> Vec<String> {
+    let trimmed = cmd.trim();
+    if trimmed.is_empty() {
+        return vec!["script is empty".to_string()];
+    }
+
+    let mut details = Vec::new();
+    if script_uses_shell_features(trimmed) {
+        details.push("uses shell syntax and may invoke multiple commands".to_string());
+    }
+
+    let invocations = extract_script_invocations(trimmed);
+    if invocations.is_empty() {
+        details.push("could not determine the invoked command".to_string());
+        return details;
+    }
+
+    if invocations.len() > 1 {
+        let summary = invocations
+            .iter()
+            .map(|invocation| format!("`{}`", invocation.command))
+            .collect::<Vec<_>>()
+            .join(", ");
+        details.push(format!("invokes commands in sequence: {summary}"));
+    }
+
+    for invocation in invocations.iter().take(3) {
+        let prefix = if invocations.len() == 1 {
+            String::new()
+        } else {
+            format!("for `{}`: ", invocation.command)
+        };
+        for line in describe_script_invocation(invocation, manifest, package_dir) {
+            details.push(format!("{prefix}{line}"));
+        }
+    }
+    if invocations.len() > 3 {
+        details.push(format!(
+            "additional commands omitted from analysis: {}",
+            invocations.len() - 3
+        ));
+    }
+
+    details
+}
+
+fn describe_script_invocation(
+    invocation: &ScriptInvocation,
+    manifest: &serde_json::Map<String, JsonValue>,
+    package_dir: Option<&Path>,
+) -> Vec<String> {
+    let command = invocation.command.as_str();
+    let mut details = Vec::new();
+
+    if is_path_like_command(command) {
+        details.push(format!(
+            "starts by executing local path `{command}` relative to the package directory"
+        ));
+    } else {
+        match command {
+            "node" => {
+                details.push("starts by invoking the Node.js interpreter".to_string());
+                if let Some(target) = invocation.tokens.get(1) {
+                    details.push(format!("node target: `{target}`"));
+                }
+            }
+            "sh" | "bash" | "zsh" => {
+                details.push(format!("starts by invoking the `{command}` shell"));
+                if invocation.tokens.iter().any(|token| token == "-c") {
+                    details.push(
+                        "shell `-c` means the rest of the string is executed as commands"
+                            .to_string(),
+                    );
+                }
+            }
+            "npm" | "pnpm" | "yarn" => {
+                details.push(format!("starts by invoking package manager `{command}`"));
+            }
+            "npx" => {
+                details.push(
+                    "starts by invoking `npx`, which can fetch and execute package binaries"
+                        .to_string(),
+                );
+            }
+            _ => {
+                details.push(format!(
+                    "starts by invoking command `{command}` via shell PATH lookup"
+                ));
+            }
+        }
+    }
+
+    if let Some(provider) = resolve_declared_command_provider(command, manifest, package_dir) {
+        details.push(format!(
+            "command matches declared dependency `{}` in {}",
+            provider.package_name, provider.section
+        ));
+        if let Some(description) = provider.description {
+            details.push(format!("package description: {description}"));
+        }
+        if let Some(bin_target) = provider.bin_target {
+            details.push(format!(
+                "local package exports binary `{command}` -> `{bin_target}`"
+            ));
+        } else if !provider.bin_names.is_empty() {
+            details.push(format!(
+                "local package exposes binaries: {}",
+                provider
+                    .bin_names
+                    .iter()
+                    .map(|name| format!("`{name}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+
+    if let Some(summary) = known_command_summary(command) {
+        details.push(format!("common behavior: {summary}"));
+    }
+
+    for action in likely_script_actions(invocation, package_dir) {
+        details.push(format!("likely action: {action}"));
+    }
+
+    details
+}
+
+fn resolve_declared_command_provider(
+    command: &str,
+    manifest: &serde_json::Map<String, JsonValue>,
+    package_dir: Option<&Path>,
+) -> Option<CommandProvider> {
+    for (section, field) in [
+        ("dependencies", "dependencies"),
+        ("devDependencies", "devDependencies"),
+        ("optionalDependencies", "optionalDependencies"),
+        ("peerDependencies", "peerDependencies"),
+    ] {
+        let Some(deps) = manifest.get(field).and_then(|value| value.as_object()) else {
+            continue;
+        };
+        for dep_name in deps.keys() {
+            let local_manifest =
+                package_dir.and_then(|dir| read_local_dependency_manifest(dir, dep_name));
+            if let Some(dep_json) = &local_manifest {
+                let bin_entries = manifest_bin_entries(dep_json);
+                if let Some((_, target)) =
+                    bin_entries.iter().find(|(bin_name, _)| bin_name == command)
+                {
+                    return Some(CommandProvider {
+                        package_name: dep_name.clone(),
+                        section,
+                        description: dep_json
+                            .get("description")
+                            .and_then(|value| value.as_str())
+                            .map(|value| value.to_string()),
+                        bin_target: Some(target.clone()),
+                        bin_names: bin_entries.into_iter().map(|(name, _)| name).collect(),
+                    });
+                }
+            }
+            if dep_name == command {
+                return Some(CommandProvider {
+                    package_name: dep_name.clone(),
+                    section,
+                    description: local_manifest
+                        .as_ref()
+                        .and_then(|json| json.get("description"))
+                        .and_then(|value| value.as_str())
+                        .map(|value| value.to_string()),
+                    bin_target: None,
+                    bin_names: local_manifest
+                        .map(|json| {
+                            manifest_bin_entries(&json)
+                                .into_iter()
+                                .map(|(name, _)| name)
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                });
+            }
+        }
+    }
+    None
+}
+
+fn read_local_dependency_manifest(package_dir: &Path, dep_name: &str) -> Option<JsonValue> {
+    let local_path = package_dir
+        .join("node_modules")
+        .join(dep_name)
+        .join("package.json");
+    if local_path.exists() {
+        if let Ok(json) = read_json_file(&local_path) {
+            return Some(json);
+        }
+    }
+
+    let sibling_path = package_dir
+        .parent()
+        .map(|parent| parent.join(dep_name).join("package.json"));
+    if let Some(path) = sibling_path {
+        if path.exists() {
+            if let Ok(json) = read_json_file(&path) {
+                return Some(json);
+            }
+        }
+    }
+
+    None
+}
+
+fn manifest_bin_entries(json: &JsonValue) -> Vec<(String, String)> {
+    let name = json.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let default_bin = name.rsplit('/').next().unwrap_or(name);
+
+    let mut bins = Vec::new();
+    match json.get("bin") {
+        Some(JsonValue::String(path)) => {
+            if !default_bin.is_empty() {
+                bins.push((default_bin.to_string(), path.to_string()));
+            }
+        }
+        Some(JsonValue::Object(map)) => {
+            for (key, val) in map {
+                if let Some(path) = val.as_str() {
+                    bins.push((key.clone(), path.to_string()));
+                }
+            }
+        }
+        _ => {}
+    }
+    bins.sort_by(|left, right| left.0.cmp(&right.0));
+    bins.dedup();
+    bins
+}
+
+fn script_uses_shell_features(cmd: &str) -> bool {
+    let mut quote = None;
+    let mut chars = cmd.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match quote {
+            Some(active) if ch == active => {
+                quote = None;
+            }
+            Some(_) => {}
+            None => {
+                if matches!(ch, '\'' | '"') {
+                    quote = Some(ch);
+                    continue;
+                }
+                if matches!(ch, ';' | '|' | '&' | '>' | '<' | '`') {
+                    return true;
+                }
+                if ch == '$' && chars.peek() == Some(&'(') {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn extract_script_invocations(cmd: &str) -> Vec<ScriptInvocation> {
+    split_script_segments(cmd)
+        .into_iter()
+        .filter_map(|segment| {
+            let tokens = shell_like_tokens(&segment);
+            let command = extract_command_from_tokens(&tokens)?;
+            Some(ScriptInvocation { command, tokens })
+        })
+        .collect()
+}
+
+fn split_script_segments(cmd: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut chars = cmd.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match quote {
+            Some(active) if ch == active => {
+                quote = None;
+                current.push(ch);
+            }
+            Some(_) => current.push(ch),
+            None => {
+                if matches!(ch, '\'' | '"') {
+                    quote = Some(ch);
+                    current.push(ch);
+                    continue;
+                }
+                let is_separator = match ch {
+                    ';' => true,
+                    '|' | '&' => {
+                        if chars.peek() == Some(&ch) {
+                            chars.next();
+                        }
+                        true
+                    }
+                    _ => false,
+                };
+                if is_separator {
+                    let trimmed = current.trim();
+                    if !trimmed.is_empty() {
+                        segments.push(trimmed.to_string());
+                    }
+                    current.clear();
+                    continue;
+                }
+                current.push(ch);
+            }
+        }
+    }
+
+    let trimmed = current.trim();
+    if !trimmed.is_empty() {
+        segments.push(trimmed.to_string());
+    }
+    segments
+}
+
+fn shell_like_tokens(segment: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut escape = false;
+
+    for ch in segment.chars() {
+        if escape {
+            current.push(ch);
+            escape = false;
+            continue;
+        }
+
+        match quote {
+            Some(active) if ch == active => {
+                quote = None;
+            }
+            Some(_) => current.push(ch),
+            None => match ch {
+                '\\' => escape = true,
+                '\'' | '"' => quote = Some(ch),
+                c if c.is_whitespace() => {
+                    if !current.is_empty() {
+                        tokens.push(std::mem::take(&mut current));
+                    }
+                }
+                _ => current.push(ch),
+            },
+        }
+    }
+
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+fn extract_command_from_tokens(tokens: &[String]) -> Option<String> {
+    let mut idx = 0;
+    while idx < tokens.len() && is_env_assignment(&tokens[idx]) {
+        idx += 1;
+    }
+    if tokens.get(idx).map(|token| token.as_str()) == Some("env") {
+        idx += 1;
+        while idx < tokens.len() && is_env_assignment(&tokens[idx]) {
+            idx += 1;
+        }
+    }
+    tokens.get(idx).cloned()
+}
+
+fn is_env_assignment(token: &str) -> bool {
+    let Some((name, value)) = token.split_once('=') else {
+        return false;
+    };
+    if value.is_empty() || name.is_empty() {
+        return false;
+    }
+    name.chars()
+        .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+}
+
+fn is_path_like_command(command: &str) -> bool {
+    command.starts_with("./") || command.starts_with("../") || command.starts_with('/')
+}
+
+fn known_command_summary(command: &str) -> Option<&'static str> {
+    match command {
+        "husky" => Some("typically installs or updates Git hook scripts under `.husky/`"),
+        "node-gyp" => Some("typically compiles native addons on the local machine"),
+        "prebuild-install" => Some("typically downloads a prebuilt native binary during install"),
+        "patch-package" => {
+            Some("typically rewrites dependency files in `node_modules` using local patches")
+        }
+        _ => None,
+    }
+}
+
+fn likely_script_actions(invocation: &ScriptInvocation, package_dir: Option<&Path>) -> Vec<String> {
+    let mut actions = Vec::new();
+    let command = invocation.command.as_str();
+
+    match command {
+        "husky" => {
+            actions.push("modifies Git hook state under `.husky/` or `.git/hooks/`".to_string());
+        }
+        "git" => {
+            let subcommand = invocation
+                .tokens
+                .get(1)
+                .map(|value| value.as_str())
+                .unwrap_or("<subcommand>");
+            actions.push(format!(
+                "runs `git {subcommand}` against the local repository"
+            ));
+            if matches!(
+                subcommand,
+                "clone" | "fetch" | "pull" | "submodule" | "ls-remote"
+            ) {
+                actions.push("accesses a Git remote".to_string());
+            }
+            if matches!(
+                subcommand,
+                "apply" | "checkout" | "clean" | "config" | "init" | "reset"
+            ) {
+                actions.push("changes repository state or configuration".to_string());
+            }
+        }
+        "curl" | "wget" => {
+            actions.push("downloads content from the network".to_string());
+        }
+        "npm" | "pnpm" | "yarn" | "npx" => {
+            actions.push(
+                "delegates to another package manager and may trigger more downloads or script execution"
+                    .to_string(),
+            );
+        }
+        "node-gyp" | "cmake" | "make" | "cargo" | "go" | "python" | "python3" => {
+            actions
+                .push("builds or executes local tooling and may compile native code".to_string());
+        }
+        "patch-package" | "patch" => {
+            actions.push("rewrites files in `node_modules` or the working tree".to_string());
+        }
+        "chmod" | "chown" | "cp" | "install" | "ln" | "mkdir" | "mv" | "rm" => {
+            actions.push("modifies local filesystem state".to_string());
+        }
+        _ => {}
+    }
+
+    if command == "node" {
+        if let Some(target) = invocation.tokens.get(1) {
+            actions.extend(inspect_local_script_target(package_dir, target));
+        }
+    } else if is_path_like_command(command) || looks_like_local_script_target(command) {
+        actions.extend(inspect_local_script_target(package_dir, command));
+    }
+
+    actions.sort();
+    actions.dedup();
+    actions
+}
+
+fn inspect_local_script_target(package_dir: Option<&Path>, raw_target: &str) -> Vec<String> {
+    let Some(package_dir) = package_dir else {
+        return Vec::new();
+    };
+    if raw_target.starts_with('-') || raw_target.is_empty() {
+        return Vec::new();
+    }
+
+    let mut details = Vec::new();
+    if Path::new(raw_target).is_absolute() {
+        details.push(format!("targets absolute path `{raw_target}`"));
+        return details;
+    }
+    if raw_target.contains("..") {
+        details.push(format!(
+            "targets path `{raw_target}` with parent traversal outside the package root"
+        ));
+        return details;
+    }
+    if !looks_like_local_script_target(raw_target) {
+        return details;
+    }
+
+    let resolved = package_dir.join(raw_target);
+    details.push(format!("inspects local script target `{raw_target}`"));
+    if !resolved.exists() {
+        details.push("target file was not found locally during analysis".to_string());
+        return details;
+    }
+    if !resolved.is_file() {
+        details.push("target path exists but is not a regular file".to_string());
+        return details;
+    }
+
+    match analyze_local_script_file(&resolved) {
+        Ok(Some(signals)) if !signals.is_empty() => {
+            details.push(format!(
+                "local script source signals: {}",
+                signals.join(", ")
+            ));
+        }
+        Ok(Some(_)) => {
+            details.push(
+                "local script source: no high-signal file/network/process patterns matched"
+                    .to_string(),
+            );
+        }
+        Ok(None) => {
+            details.push(format!(
+                "target file is larger than {} bytes; skipped inline source analysis",
+                MAX_SCRIPT_ANALYSIS_SIZE
+            ));
+        }
+        Err(err) => {
+            details.push(format!("could not read local script source: {err}"));
+        }
+    }
+
+    details
+}
+
+fn analyze_local_script_file(path: &Path) -> Result<Option<Vec<String>>> {
+    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    if bytes.len() > MAX_SCRIPT_ANALYSIS_SIZE {
+        return Ok(None);
+    }
+    let source = String::from_utf8_lossy(&bytes);
+    Ok(Some(script_source_signals(&source)))
+}
+
+fn script_source_signals(source: &str) -> Vec<String> {
+    let lowered = source.to_ascii_lowercase();
+    let mut signals = Vec::new();
+
+    if lowered.contains("child_process")
+        || lowered.contains("exec(")
+        || lowered.contains("spawn(")
+        || lowered.contains("execsync(")
+        || lowered.contains("spawnsync(")
+    {
+        signals.push("spawns subprocesses".to_string());
+    }
+    if lowered.contains("http://")
+        || lowered.contains("https://")
+        || lowered.contains("fetch(")
+        || lowered.contains("axios")
+        || lowered.contains("http.request")
+        || lowered.contains("https.request")
+        || lowered.contains("xmlhttprequest")
+    {
+        signals.push("accesses the network".to_string());
+    }
+    if lowered.contains("fs.writefile")
+        || lowered.contains("fs.promises.writefile")
+        || lowered.contains("writefilesync")
+        || lowered.contains("appendfile")
+        || lowered.contains("mkdir(")
+        || lowered.contains("mkdirsync")
+        || lowered.contains("unlink(")
+        || lowered.contains("rm(")
+        || lowered.contains("rmsync")
+        || lowered.contains("rename(")
+        || lowered.contains("chmod(")
+        || lowered.contains("copyfile")
+    {
+        signals.push("modifies local files".to_string());
+    }
+    if lowered.contains("process.env") {
+        signals.push("reads environment variables".to_string());
+    }
+    if lowered.contains("eval(") || lowered.contains("new function") || lowered.contains("vm.runin")
+    {
+        signals.push("uses dynamic code execution".to_string());
+    }
+    if lowered.contains(".git/hooks") || lowered.contains(".husky") {
+        signals.push("touches Git hook files".to_string());
+    }
+
+    signals.sort();
+    signals.dedup();
+    signals
+}
+
+fn looks_like_local_script_target(target: &str) -> bool {
+    target.contains('/')
+        || target.ends_with(".js")
+        || target.ends_with(".cjs")
+        || target.ends_with(".mjs")
+        || target.ends_with(".ts")
+        || target.ends_with(".sh")
+        || target.ends_with(".bash")
+}
+
 fn is_exotic_requirement(req: &str) -> bool {
     let lower = req.to_ascii_lowercase();
     lower.starts_with("file:")
@@ -1226,9 +2281,16 @@ fn is_exotic_requirement(req: &str) -> bool {
         || lower.contains("://")
 }
 
-fn package_publish_time(meta: &RegistryPackage, version: &str) -> Result<Option<chrono::DateTime<Utc>>> {
-    let Some(times) = &meta.time else { return Ok(None); };
-    let Some(ts) = times.get(version) else { return Ok(None); };
+fn package_publish_time(
+    meta: &RegistryPackage,
+    version: &str,
+) -> Result<Option<chrono::DateTime<Utc>>> {
+    let Some(times) = &meta.time else {
+        return Ok(None);
+    };
+    let Some(ts) = times.get(version) else {
+        return Ok(None);
+    };
     let parsed = chrono::DateTime::parse_from_rfc3339(ts)
         .with_context(|| format!("parse timestamp {ts}"))?
         .with_timezone(&Utc);
@@ -1236,8 +2298,7 @@ fn package_publish_time(meta: &RegistryPackage, version: &str) -> Result<Option<
 }
 
 fn compile_yara_rules(path: &str) -> Result<yara::Rules> {
-    let source = fs::read_to_string(path)
-        .with_context(|| format!("read yara rules {}", path))?;
+    let source = fs::read_to_string(path).with_context(|| format!("read yara rules {}", path))?;
     let compiler = Compiler::new().context("initialize yara compiler")?;
     let compiler = compiler
         .add_rules_str(&source)
@@ -1264,8 +2325,17 @@ fn scan_with_yara(
     root: &Path,
     stream_label: Option<&str>,
 ) -> Result<YaraScanResult> {
+    scan_with_yara_filtered(rules, root, stream_label, &[])
+}
+
+fn scan_with_yara_filtered(
+    rules: &yara::Rules,
+    root: &Path,
+    stream_label: Option<&str>,
+    skip_dir_names: &[&str],
+) -> Result<YaraScanResult> {
     let mut files = Vec::new();
-    collect_files(root, &mut files)?;
+    collect_files_filtered(root, &mut files, skip_dir_names)?;
     let files_scanned = files.len();
     let mut matches = Vec::new();
     let mut rule_matches = 0;
@@ -1310,12 +2380,15 @@ fn scan_with_yara(
     })
 }
 
-fn collect_files(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+fn collect_files_filtered(
+    root: &Path,
+    out: &mut Vec<PathBuf>,
+    skip_dir_names: &[&str],
+) -> Result<()> {
     if !root.exists() {
         return Ok(());
     }
-    let meta = fs::symlink_metadata(root)
-        .with_context(|| format!("stat {}", root.display()))?;
+    let meta = fs::symlink_metadata(root).with_context(|| format!("stat {}", root.display()))?;
     let file_type = meta.file_type();
     if file_type.is_symlink() {
         return Ok(());
@@ -1325,9 +2398,14 @@ fn collect_files(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
         return Ok(());
     }
     if file_type.is_dir() {
+        if let Some(name) = root.file_name().and_then(|value| value.to_str()) {
+            if skip_dir_names.iter().any(|skip| skip == &name) {
+                return Ok(());
+            }
+        }
         for entry in fs::read_dir(root).with_context(|| format!("read {}", root.display()))? {
             let entry = entry?;
-            collect_files(&entry.path(), out)?;
+            collect_files_filtered(&entry.path(), out, skip_dir_names)?;
         }
     }
     Ok(())
@@ -1360,7 +2438,11 @@ fn format_match_data(data: &[u8]) -> String {
 }
 
 fn print_yara_match(label: &str, detail: &YaraMatchDetail) {
-    println!("YARA match {label} {} {}", detail.rule, detail.path.display());
+    println!(
+        "YARA match {label} {} {}",
+        detail.rule,
+        detail.path.display()
+    );
     if !detail.tags.is_empty() {
         println!("  tags: {}", detail.tags.join(", "));
     }
@@ -1369,17 +2451,17 @@ fn print_yara_match(label: &str, detail: &YaraMatchDetail) {
     }
 }
 
-fn print_security_report(findings: &[ScanIssue], total: usize) {
+fn print_security_report(findings: &[ScanIssue], total: usize, importers_scanned: usize) {
     println!("Security scan report:");
     println!("- packages scanned: {total}");
+    println!("- workspace importers scanned: {importers_scanned}");
     if findings.is_empty() {
         println!("- issues found: 0");
         println!("No issues detected.");
         return;
     }
-    let issue_count: usize = findings.iter().map(|f| f.details.len()).sum();
     println!("- packages with issues: {}", findings.len());
-    println!("- issues found: {issue_count}");
+    println!("- issues found: {}", issue_count(findings));
     for finding in findings {
         println!();
         println!("{}@{}", finding.name, finding.version);
@@ -1387,6 +2469,10 @@ fn print_security_report(findings: &[ScanIssue], total: usize) {
             println!("- {detail}");
         }
     }
+}
+
+fn issue_count(findings: &[ScanIssue]) -> usize {
+    findings.iter().map(|finding| finding.details.len()).sum()
 }
 
 fn print_yara_summary(summary: &YaraSummary, enabled: bool) {
@@ -1475,7 +2561,12 @@ fn read_overrides(manifest: &JsonValue) -> HashMap<String, String> {
     result
 }
 
-fn resolve_dependencies(specs: &[PackageSpec], debug: bool, overrides: &HashMap<String, String>, registry: &str) -> Result<ResolveResult> {
+fn resolve_dependencies(
+    specs: &[PackageSpec],
+    debug: bool,
+    overrides: &HashMap<String, String>,
+    registry: &str,
+) -> Result<ResolveResult> {
     println!("Progress: resolving dependencies");
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
@@ -1489,7 +2580,8 @@ fn resolve_dependencies(specs: &[PackageSpec], debug: bool, overrides: &HashMap<
 
     for spec in specs {
         validate_package_name(&spec.name)?;
-        let meta = fetch_registry_metadata(&client, &spec.name, &mut metadata_cache, debug, registry)?;
+        let meta =
+            fetch_registry_metadata(&client, &spec.name, &mut metadata_cache, debug, registry)?;
         let reqs = spec
             .requested
             .as_ref()
@@ -1515,7 +2607,9 @@ fn resolve_dependencies(specs: &[PackageSpec], debug: bool, overrides: &HashMap<
             .get(&version)
             .ok_or_else(|| anyhow!("missing version metadata for {name}@{version}"))?;
         if version_entry.engines.is_some() {
-            warn(&format!("engines for {name}@{version} are recorded but not enforced"));
+            warn(&format!(
+                "engines for {name}@{version} are recorded but not enforced"
+            ));
         }
 
         let dependencies = resolve_dependency_set(
@@ -1538,16 +2632,16 @@ fn resolve_dependencies(specs: &[PackageSpec], debug: bool, overrides: &HashMap<
         ) {
             Ok(deps) => deps,
             Err(e) => {
-                warn(&format!("optional dependency resolution failed for {name}@{version}: {e}"));
+                warn(&format!(
+                    "optional dependency resolution failed for {name}@{version}: {e}"
+                ));
                 BTreeMap::new()
             }
         };
 
         // Resolve non-optional peer dependencies
-        let peer_deps_to_resolve: Option<HashMap<String, String>> = version_entry
-            .peer_dependencies
-            .as_ref()
-            .map(|peers| {
+        let peer_deps_to_resolve: Option<HashMap<String, String>> =
+            version_entry.peer_dependencies.as_ref().map(|peers| {
                 let meta_map = version_entry.peer_dependencies_meta.as_ref();
                 peers
                     .iter()
@@ -1573,7 +2667,9 @@ fn resolve_dependencies(specs: &[PackageSpec], debug: bool, overrides: &HashMap<
         ) {
             Ok(deps) => deps,
             Err(e) => {
-                warn(&format!("peer dependency resolution failed for {name}@{version}: {e}"));
+                warn(&format!(
+                    "peer dependency resolution failed for {name}@{version}: {e}"
+                ));
                 BTreeMap::new()
             }
         };
@@ -1597,6 +2693,81 @@ fn resolve_dependencies(specs: &[PackageSpec], debug: bool, overrides: &HashMap<
     })
 }
 
+fn resolve_top_level_only(
+    specs: &[PackageSpec],
+    debug: bool,
+    overrides: &HashMap<String, String>,
+    registry: &str,
+) -> Result<ResolveResult> {
+    println!("Progress: resolving top-level packages only");
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .context("build http client")?;
+
+    let mut root_resolved: HashMap<String, String> = HashMap::new();
+    let mut metadata_cache: HashMap<String, RegistryPackage> = HashMap::new();
+
+    for spec in specs {
+        validate_package_name(&spec.name)?;
+        let meta =
+            fetch_registry_metadata(&client, &spec.name, &mut metadata_cache, debug, registry)?;
+        let reqs = spec
+            .requested
+            .as_ref()
+            .map(|s| vec![s.clone()])
+            .unwrap_or_default();
+        let version = select_version(&spec.name, &reqs, &meta, overrides)?;
+        root_resolved.insert(spec.name.clone(), version);
+    }
+
+    build_top_level_only_result(specs, root_resolved, metadata_cache)
+}
+
+fn build_top_level_only_result(
+    specs: &[PackageSpec],
+    root_resolved: HashMap<String, String>,
+    metadata: HashMap<String, RegistryPackage>,
+) -> Result<ResolveResult> {
+    let mut nodes = HashMap::new();
+
+    for spec in specs {
+        let version = root_resolved
+            .get(&spec.name)
+            .ok_or_else(|| anyhow!("failed to resolve {}", spec.name))?;
+        let meta = metadata
+            .get(&spec.name)
+            .ok_or_else(|| anyhow!("missing metadata for {}", spec.name))?;
+        let version_entry = meta
+            .versions
+            .get(version)
+            .ok_or_else(|| anyhow!("missing version metadata for {}@{}", spec.name, version))?;
+        if version_entry.engines.is_some() {
+            warn(&format!(
+                "engines for {}@{} are recorded but not enforced",
+                spec.name, version
+            ));
+        }
+
+        nodes.insert(
+            node_key(&spec.name, version),
+            ResolvedNode {
+                name: spec.name.clone(),
+                version: version.clone(),
+                dependencies: BTreeMap::new(),
+                optional_dependencies: BTreeMap::new(),
+                peer_dependencies: BTreeMap::new(),
+            },
+        );
+    }
+
+    Ok(ResolveResult {
+        root_resolved,
+        nodes,
+        metadata,
+    })
+}
+
 fn resolve_dependency_set(
     client: &reqwest::blocking::Client,
     deps: Option<&HashMap<String, String>>,
@@ -1606,7 +2777,9 @@ fn resolve_dependency_set(
     overrides: &HashMap<String, String>,
     registry: &str,
 ) -> Result<BTreeMap<String, String>> {
-    let Some(deps) = deps else { return Ok(BTreeMap::new()); };
+    let Some(deps) = deps else {
+        return Ok(BTreeMap::new());
+    };
     let mut resolved = BTreeMap::new();
     for (dep, req) in deps {
         let alias = ensure_safe_requirement(dep, req)?;
@@ -1615,8 +2788,10 @@ fn resolve_dependency_set(
         } else {
             (dep.as_str(), req.as_str())
         };
-        let dep_meta = fetch_registry_metadata(client, fetch_name, metadata_cache, debug, registry)?;
-        let dep_version = select_version(fetch_name, &[fetch_req.to_string()], &dep_meta, overrides)?;
+        let dep_meta =
+            fetch_registry_metadata(client, fetch_name, metadata_cache, debug, registry)?;
+        let dep_version =
+            select_version(fetch_name, &[fetch_req.to_string()], &dep_meta, overrides)?;
         resolved.insert(dep.to_string(), dep_version.clone());
         queue.push_back((fetch_name.to_string(), dep_version));
     }
@@ -1733,7 +2908,12 @@ fn fetch_registry_metadata(
     Ok(cache.get(name).expect("metadata cached").clone())
 }
 
-fn select_version(name: &str, reqs: &[String], meta: &RegistryPackage, overrides: &HashMap<String, String>) -> Result<String> {
+fn select_version(
+    name: &str,
+    reqs: &[String],
+    meta: &RegistryPackage,
+    overrides: &HashMap<String, String>,
+) -> Result<String> {
     let override_vec;
     let reqs = if let Some(override_req) = overrides.get(name) {
         override_vec = vec![override_req.clone()];
@@ -1760,14 +2940,18 @@ fn select_version(name: &str, reqs: &[String], meta: &RegistryPackage, overrides
             let normalized = match normalize_range(&part) {
                 Ok(value) => value,
                 Err(err) => {
-                    warn(&format!("unsupported version range '{req}': {err}; falling back to latest"));
+                    warn(&format!(
+                        "unsupported version range '{req}': {err}; falling back to latest"
+                    ));
                     continue;
                 }
             };
             let parsed = VersionReq::parse(&normalized)
                 .with_context(|| format!("parse version req {req}"))?;
             for version_str in meta.versions.keys() {
-                let Ok(version) = Version::parse(version_str) else { continue };
+                let Ok(version) = Version::parse(version_str) else {
+                    continue;
+                };
                 if parsed.matches(&version) {
                     if selected.as_ref().map_or(true, |v| &version > v) {
                         selected = Some(version);
@@ -1965,7 +3149,9 @@ fn extract_string_map(value: &JsonValue, context: &str) -> Option<BTreeMap<Strin
         if let Some(s) = val.as_str() {
             out.insert(key.clone(), s.to_string());
         } else {
-            warn(&format!("{context} has non-string value for {key}; ignored"));
+            warn(&format!(
+                "{context} has non-string value for {key}; ignored"
+            ));
         }
     }
     if out.is_empty() {
@@ -1975,99 +3161,26 @@ fn extract_string_map(value: &JsonValue, context: &str) -> Option<BTreeMap<Strin
     }
 }
 
-fn read_package_bin_entries(package_dir: &Path) -> Result<BTreeMap<String, PathBuf>> {
-    let manifest_path = package_dir.join("package.json");
-    if !manifest_path.exists() {
-        return Ok(BTreeMap::new());
-    }
-    let raw = fs::read_to_string(&manifest_path)
-        .with_context(|| format!("read {}", manifest_path.display()))?;
-    let json: JsonValue = serde_json::from_str(&raw)
-        .with_context(|| format!("parse {}", manifest_path.display()))?;
-    let name = json.get("name").and_then(|v| v.as_str()).unwrap_or("");
-    let bin_name = name.rsplit('/').next().unwrap_or(name);
-
-    let mut entries = BTreeMap::new();
-    match json.get("bin") {
-        Some(JsonValue::String(s)) => {
-            let path = PathBuf::from(s);
-            if path.components().any(|c| matches!(c, Component::ParentDir)) {
-                bail!("bin path contains ..: {s}");
-            }
-            entries.insert(bin_name.to_string(), package_dir.join(&path));
-        }
-        Some(JsonValue::Object(map)) => {
-            for (key, val) in map {
-                if let Some(s) = val.as_str() {
-                    let path = PathBuf::from(s);
-                    if path.components().any(|c| matches!(c, Component::ParentDir)) {
-                        bail!("bin path contains ..: {s}");
-                    }
-                    entries.insert(key.clone(), package_dir.join(&path));
-                }
-            }
-        }
-        _ => {}
-    }
-    Ok(entries)
+fn blocked_bin_names(json: &JsonValue) -> Vec<String> {
+    manifest_bin_entries(json)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect()
 }
 
-fn link_bin_entries(bin_dir: &Path, entries: &BTreeMap<String, PathBuf>) -> Result<()> {
-    if entries.is_empty() {
-        return Ok(());
-    }
-    fs::create_dir_all(bin_dir)
-        .with_context(|| format!("create {}", bin_dir.display()))?;
-    for (name, target) in entries {
-        let link_path = bin_dir.join(name);
-        remove_existing_path(&link_path)?;
-        #[cfg(unix)]
-        {
-            symlink(target, &link_path)
-                .with_context(|| format!("symlink bin {}", link_path.display()))?;
-            use std::os::unix::fs::PermissionsExt;
-            if target.exists() {
-                let meta = fs::metadata(target)?;
-                let mut perms = meta.permissions();
-                let mode = perms.mode() | 0o111;
-                perms.set_mode(mode);
-                fs::set_permissions(target, perms)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn link_root_bin_entries(cwd: &Path, root_resolved: &HashMap<String, String>) -> Result<()> {
-    let bin_dir = cwd.join("node_modules").join(".bin");
-    for (name, version) in root_resolved {
-        let pkg_dir = store_package_path(cwd, name, version);
-        let entries = read_package_bin_entries(&pkg_dir)?;
-        link_bin_entries(&bin_dir, &entries)?;
-    }
-    Ok(())
-}
-
-fn link_nested_bin_entries(cwd: &Path, node: &ResolvedNode) -> Result<()> {
-    let store_nm = store_package_root(cwd, &node.name, &node.version).join("node_modules");
-    let bin_dir = store_nm.join(".bin");
-    for (dep, dep_version) in node.dependencies.iter().chain(node.peer_dependencies.iter()) {
-        let dep_pkg_dir = store_package_path(cwd, dep, dep_version);
-        let entries = read_package_bin_entries(&dep_pkg_dir)?;
-        link_bin_entries(&bin_dir, &entries)?;
-    }
-    Ok(())
-}
-
-fn install_with_resolution(cwd: &Path, resolve: &ResolveResult, debug: bool, registry: &str) -> Result<()> {
+fn install_with_resolution(
+    cwd: &Path,
+    resolve: &ResolveResult,
+    debug: bool,
+    registry: &str,
+) -> Result<()> {
     let node_modules = cwd.join("node_modules");
     if !node_modules.exists() {
         fs::create_dir_all(&node_modules)
             .with_context(|| format!("create {}", node_modules.display()))?;
     }
     let store_root = node_modules.join(".pnpm");
-    fs::create_dir_all(&store_root)
-        .with_context(|| format!("create {}", store_root.display()))?;
+    fs::create_dir_all(&store_root).with_context(|| format!("create {}", store_root.display()))?;
 
     let custom_host = custom_registry_host(registry);
     let custom_host_ref = custom_host.as_deref();
@@ -2075,18 +3188,19 @@ fn install_with_resolution(cwd: &Path, resolve: &ResolveResult, debug: bool, reg
     let mut node_keys: Vec<_> = resolve.nodes.keys().cloned().collect();
     node_keys.sort();
     for key in &node_keys {
-        let node = resolve
-            .nodes
-            .get(key)
-            .expect("node key exists");
-        install_package(cwd, &node.name, &node.version, resolve, debug, custom_host_ref)?;
+        let node = resolve.nodes.get(key).expect("node key exists");
+        install_package(
+            cwd,
+            &node.name,
+            &node.version,
+            resolve,
+            debug,
+            custom_host_ref,
+        )?;
     }
 
     for key in &node_keys {
-        let node = resolve
-            .nodes
-            .get(key)
-            .expect("node key exists");
+        let node = resolve.nodes.get(key).expect("node key exists");
         link_package_deps(cwd, node)?;
     }
 
@@ -2098,15 +3212,6 @@ fn install_with_resolution(cwd: &Path, resolve: &ResolveResult, debug: bool, reg
         .chain(optional_deps.iter())
     {
         link_root_dep(cwd, name, &resolve.root_resolved)?;
-    }
-
-    // Link .bin entries for root dependencies (Change 10)
-    link_root_bin_entries(cwd, &resolve.root_resolved)?;
-
-    // Link .bin entries for nested dependencies
-    for key in &node_keys {
-        let node = resolve.nodes.get(key).expect("node key exists");
-        link_nested_bin_entries(cwd, node)?;
     }
 
     write_lockfile(cwd, resolve)?;
@@ -2160,8 +3265,7 @@ fn install_package(
             .with_context(|| format!("remove {}", store_root.display()))?;
     }
     if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     println!("Installing {name}@{version}");
     match fs::rename(&package_dir, &dest) {
@@ -2251,22 +3355,60 @@ fn pnpm_dir_name(name: &str, version: &str) -> String {
     safe
 }
 
+fn locate_store_package_path(cwd: &Path, name: &str, version: &str) -> PathBuf {
+    let direct = store_package_path(cwd, name, version);
+    if direct.exists() {
+        return direct;
+    }
+
+    let prefix = pnpm_dir_name(name, version);
+    let store_root = cwd.join("node_modules").join(".pnpm");
+    let Ok(entries) = fs::read_dir(&store_root) else {
+        return direct;
+    };
+
+    let mut candidates = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(dir_name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        let matches_variant = match dir_name.strip_prefix(&prefix) {
+            Some("") => true,
+            Some(suffix) => suffix.starts_with('_') || suffix.starts_with('('),
+            None => false,
+        };
+        if matches_variant {
+            let candidate = path.join("node_modules").join(name);
+            if candidate.exists() {
+                candidates.push(candidate);
+            }
+        }
+    }
+
+    candidates.sort();
+    candidates.into_iter().next().unwrap_or(direct)
+}
+
 fn link_package_deps(cwd: &Path, node: &ResolvedNode) -> Result<()> {
-    let all_deps = node.dependencies.iter()
+    let all_deps = node
+        .dependencies
+        .iter()
         .chain(node.peer_dependencies.iter());
     let has_any = !node.dependencies.is_empty() || !node.peer_dependencies.is_empty();
     if !has_any {
         return Ok(());
     }
     let store_root = store_package_root(cwd, &node.name, &node.version).join("node_modules");
-    fs::create_dir_all(&store_root)
-        .with_context(|| format!("create {}", store_root.display()))?;
+    fs::create_dir_all(&store_root).with_context(|| format!("create {}", store_root.display()))?;
     for (dep, dep_version) in all_deps {
         let target = store_package_path(cwd, dep, dep_version);
         let link_path = store_root.join(dep);
         if let Some(parent) = link_path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("create {}", parent.display()))?;
+            fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
         }
         remove_existing_path(&link_path)?;
         #[cfg(unix)]
@@ -2278,23 +3420,19 @@ fn link_package_deps(cwd: &Path, node: &ResolvedNode) -> Result<()> {
     Ok(())
 }
 
-fn link_root_dep(
-    cwd: &Path,
-    name: &str,
-    resolved: &HashMap<String, String>,
-) -> Result<()> {
-    let Some(version) = resolved.get(name) else { return Ok(()) };
+fn link_root_dep(cwd: &Path, name: &str, resolved: &HashMap<String, String>) -> Result<()> {
+    let Some(version) = resolved.get(name) else {
+        return Ok(());
+    };
     let target = store_package_path(cwd, name, version);
     let link_path = package_install_path(cwd, name);
     if let Some(parent) = link_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     remove_existing_path(&link_path)?;
     #[cfg(unix)]
     {
-        symlink(&target, &link_path)
-            .with_context(|| format!("symlink {}", link_path.display()))?;
+        symlink(&target, &link_path).with_context(|| format!("symlink {}", link_path.display()))?;
     }
     Ok(())
 }
@@ -2303,8 +3441,7 @@ fn remove_existing_path(path: &Path) -> Result<()> {
     if !path.exists() {
         return Ok(());
     }
-    let meta = fs::symlink_metadata(path)
-        .with_context(|| format!("stat {}", path.display()))?;
+    let meta = fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))?;
     if meta.file_type().is_dir() && !meta.file_type().is_symlink() {
         fs::remove_dir_all(path).with_context(|| format!("remove {}", path.display()))?;
     } else {
@@ -2452,8 +3589,7 @@ fn unpack_tarball(bytes: &[u8], dest: &Path) -> Result<()> {
         }
 
         if let Some(parent) = full_path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("create {}", parent.display()))?;
+            fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
         }
         let mut file = fs::File::create(&full_path)
             .with_context(|| format!("create {}", full_path.display()))?;
@@ -2511,25 +3647,35 @@ fn report_blocked_scripts(package_dir: &Path) -> Result<()> {
     }
     let raw = fs::read_to_string(&manifest_path)
         .with_context(|| format!("read {}", manifest_path.display()))?;
-    let json: JsonValue = serde_json::from_str(&raw)
-        .with_context(|| format!("parse {}", manifest_path.display()))?;
+    let json: JsonValue =
+        serde_json::from_str(&raw).with_context(|| format!("parse {}", manifest_path.display()))?;
 
-    let name = json.get("name").and_then(|v| v.as_str()).unwrap_or("<unknown>");
+    let name = json
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("<unknown>");
     let version = json
         .get("version")
         .and_then(|v| v.as_str())
         .unwrap_or("<unknown>");
+    let obj = json
+        .as_object()
+        .ok_or_else(|| anyhow!("package.json is not a JSON object"))?;
 
-    let scripts = match json.get("scripts").and_then(|v| v.as_object()) {
-        Some(obj) => obj,
-        None => return Ok(()),
-    };
+    for bin_name in blocked_bin_names(&json) {
+        println!("pnpm-rs: blocked bin link for {name}@{version}: {bin_name}");
+    }
 
-    for script_name in ["preinstall", "install", "postinstall", "prepare"] {
-        if let Some(cmd) = scripts.get(script_name).and_then(|v| v.as_str()) {
-            println!(
-                "pnpm-rs: blocked {script_name} for {name}@{version}: {cmd} (run manually if required)"
-            );
+    if let Some(scripts) = obj.get("scripts").and_then(|v| v.as_object()) {
+        for script_name in ["preinstall", "install", "postinstall", "prepare"] {
+            if let Some(cmd) = scripts.get(script_name).and_then(|v| v.as_str()) {
+                println!(
+                    "pnpm-rs: blocked {script_name} for {name}@{version}: {cmd} (run manually if required)"
+                );
+                for detail in describe_lifecycle_script(obj, cmd, Some(package_dir)) {
+                    println!("pnpm-rs:   {detail}");
+                }
+            }
         }
     }
 
@@ -2569,7 +3715,10 @@ struct Importer {
     dependencies: BTreeMap<String, ImporterDepOut>,
     #[serde(rename = "devDependencies", skip_serializing_if = "BTreeMap::is_empty")]
     dev_dependencies: BTreeMap<String, ImporterDepOut>,
-    #[serde(rename = "optionalDependencies", skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        rename = "optionalDependencies",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     optional_dependencies: BTreeMap<String, ImporterDepOut>,
 }
 
@@ -2584,11 +3733,17 @@ struct PackageSnapshot {
     resolution: Resolution,
     #[serde(skip_serializing_if = "Option::is_none")]
     dependencies: Option<BTreeMap<String, String>>,
-    #[serde(rename = "optionalDependencies", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "optionalDependencies",
+        skip_serializing_if = "Option::is_none"
+    )]
     optional_dependencies: Option<BTreeMap<String, String>>,
     #[serde(rename = "peerDependencies", skip_serializing_if = "Option::is_none")]
     peer_dependencies: Option<BTreeMap<String, String>>,
-    #[serde(rename = "peerDependenciesMeta", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "peerDependenciesMeta",
+        skip_serializing_if = "Option::is_none"
+    )]
     peer_dependencies_meta: Option<BTreeMap<String, PeerDepMeta>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     engines: Option<BTreeMap<String, String>>,
@@ -2600,7 +3755,10 @@ struct PackageSnapshot {
 struct SnapshotOut {
     #[serde(skip_serializing_if = "Option::is_none")]
     dependencies: Option<BTreeMap<String, String>>,
-    #[serde(rename = "optionalDependencies", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "optionalDependencies",
+        skip_serializing_if = "Option::is_none"
+    )]
     optional_dependencies: Option<BTreeMap<String, String>>,
     #[serde(rename = "peerDependencies", skip_serializing_if = "Option::is_none")]
     peer_dependencies: Option<BTreeMap<String, String>>,
@@ -2699,9 +3857,7 @@ fn write_lockfile(cwd: &Path, resolve: &ResolveResult) -> Result<()> {
         packages.insert(
             key.clone(),
             PackageSnapshot {
-                resolution: Resolution {
-                    integrity,
-                },
+                resolution: Resolution { integrity },
                 dependencies: None,
                 optional_dependencies: None,
                 peer_dependencies: peer_deps.clone(),
@@ -2716,7 +3872,11 @@ fn write_lockfile(cwd: &Path, resolve: &ResolveResult) -> Result<()> {
         for (k, v) in &node.peer_dependencies {
             snapshot_deps.entry(k.clone()).or_insert_with(|| v.clone());
         }
-        let snapshot_deps_opt = if snapshot_deps.is_empty() { None } else { Some(snapshot_deps) };
+        let snapshot_deps_opt = if snapshot_deps.is_empty() {
+            None
+        } else {
+            Some(snapshot_deps)
+        };
 
         snapshots.insert(
             key,
@@ -2767,10 +3927,18 @@ fn lockfile_to_yaml(lockfile: &Lockfile) -> String {
     if let Some(settings) = &lockfile.settings {
         out.push_str("settings:\n");
         out.push_str("  autoInstallPeers: ");
-        out.push_str(if settings.auto_install_peers { "true" } else { "false" });
+        out.push_str(if settings.auto_install_peers {
+            "true"
+        } else {
+            "false"
+        });
         out.push('\n');
         out.push_str("  excludeLinksFromLockfile: ");
-        out.push_str(if settings.exclude_links_from_lockfile { "true" } else { "false" });
+        out.push_str(if settings.exclude_links_from_lockfile {
+            "true"
+        } else {
+            "false"
+        });
         out.push('\n');
     }
 
@@ -2781,7 +3949,11 @@ fn lockfile_to_yaml(lockfile: &Lockfile) -> String {
         out.push_str(":\n");
         write_dependency_section_out(&mut out, "dependencies", &importer.dependencies);
         write_dependency_section_out(&mut out, "devDependencies", &importer.dev_dependencies);
-        write_dependency_section_out(&mut out, "optionalDependencies", &importer.optional_dependencies);
+        write_dependency_section_out(
+            &mut out,
+            "optionalDependencies",
+            &importer.optional_dependencies,
+        );
     }
 
     out.push_str("packages:\n");
@@ -2836,7 +4008,12 @@ fn lockfile_to_yaml(lockfile: &Lockfile) -> String {
         out.push_str(&escape_yaml_quoted(key));
         out.push_str(":\n");
         let mut wrote = write_dep_map_opt(&mut out, 4, "dependencies", &snapshot.dependencies);
-        wrote |= write_dep_map_opt(&mut out, 4, "optionalDependencies", &snapshot.optional_dependencies);
+        wrote |= write_dep_map_opt(
+            &mut out,
+            4,
+            "optionalDependencies",
+            &snapshot.optional_dependencies,
+        );
         wrote |= write_dep_map_opt(&mut out, 4, "peerDependencies", &snapshot.peer_dependencies);
         if !wrote {
             out.push_str("    {}\n");
@@ -2977,23 +4154,38 @@ fn lockfile_satisfies_manifest(
     dev_deps: &HashMap<String, String>,
     optional_deps: &HashMap<String, String>,
 ) -> bool {
-    let Some(importers) = &lockfile.importers else { return false; };
-    let Some(root) = importers.get(".") else { return false; };
+    let Some(importers) = &lockfile.importers else {
+        return false;
+    };
+    let Some(root) = importers.get(".") else {
+        return false;
+    };
 
     fn specifiers_match(
         lockfile_deps: &Option<HashMap<String, ImporterDepIn>>,
         manifest_deps: &HashMap<String, String>,
     ) -> bool {
-        let lockfile_map = lockfile_deps.as_ref().map(|m| {
-            m.iter().map(|(k, v)| {
-                let spec = match v {
-                    ImporterDepIn::String(s) => s.clone(),
-                    ImporterDepIn::Object { specifier: Some(s), .. } => s.clone(),
-                    ImporterDepIn::Object { specifier: None, version, .. } => version.clone().unwrap_or_default(),
-                };
-                (k.clone(), spec)
-            }).collect::<HashMap<_, _>>()
-        }).unwrap_or_default();
+        let lockfile_map = lockfile_deps
+            .as_ref()
+            .map(|m| {
+                m.iter()
+                    .map(|(k, v)| {
+                        let spec = match v {
+                            ImporterDepIn::String(s) => s.clone(),
+                            ImporterDepIn::Object {
+                                specifier: Some(s), ..
+                            } => s.clone(),
+                            ImporterDepIn::Object {
+                                specifier: None,
+                                version,
+                                ..
+                            } => version.clone().unwrap_or_default(),
+                        };
+                        (k.clone(), spec)
+                    })
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default();
 
         if lockfile_map.len() != manifest_deps.len() {
             return false;
@@ -3011,7 +4203,12 @@ fn lockfile_satisfies_manifest(
         && specifiers_match(&root.optional_dependencies, optional_deps)
 }
 
-fn install_from_lockfile(cwd: &Path, lockfile: &LockfileIn, _debug: bool, registry: &str) -> Result<()> {
+fn install_from_lockfile(
+    cwd: &Path,
+    lockfile: &LockfileIn,
+    _debug: bool,
+    registry: &str,
+) -> Result<()> {
     println!("Progress: installing from lockfile");
     let node_modules = cwd.join("node_modules");
     if !node_modules.exists() {
@@ -3019,8 +4216,7 @@ fn install_from_lockfile(cwd: &Path, lockfile: &LockfileIn, _debug: bool, regist
             .with_context(|| format!("create {}", node_modules.display()))?;
     }
     let store_root = node_modules.join(".pnpm");
-    fs::create_dir_all(&store_root)
-        .with_context(|| format!("create {}", store_root.display()))?;
+    fs::create_dir_all(&store_root).with_context(|| format!("create {}", store_root.display()))?;
 
     let custom_host = custom_registry_host(registry);
     let custom_host_ref = custom_host.as_deref();
@@ -3031,7 +4227,9 @@ fn install_from_lockfile(cwd: &Path, lockfile: &LockfileIn, _debug: bool, regist
 
     // Install all packages from lockfile
     for (key, pkg_snapshot) in &packages {
-        let Some((name, version)) = parse_lockfile_key(key) else { continue };
+        let Some((name, version)) = parse_lockfile_key(key) else {
+            continue;
+        };
         let dest = store_package_path(cwd, &name, &version);
         if dest.exists() {
             // Already installed
@@ -3089,8 +4287,7 @@ fn install_from_lockfile(cwd: &Path, lockfile: &LockfileIn, _debug: bool, regist
                 .with_context(|| format!("remove {}", store_pkg_root.display()))?;
         }
         if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("create {}", parent.display()))?;
+            fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
         }
         println!("Installing {name}@{version}");
         match fs::rename(&package_dir, &dest) {
@@ -3107,7 +4304,9 @@ fn install_from_lockfile(cwd: &Path, lockfile: &LockfileIn, _debug: bool, regist
 
     // Link dependencies using snapshots
     for (key, snapshot) in &snapshots {
-        let Some((name, version)) = parse_lockfile_key(key) else { continue };
+        let Some((name, version)) = parse_lockfile_key(key) else {
+            continue;
+        };
         let all_deps = merge_dep_maps(
             snapshot.dependencies.clone(),
             None,
@@ -3117,8 +4316,7 @@ fn install_from_lockfile(cwd: &Path, lockfile: &LockfileIn, _debug: bool, regist
             continue;
         }
         let nm_root = store_package_root(cwd, &name, &version).join("node_modules");
-        fs::create_dir_all(&nm_root)
-            .with_context(|| format!("create {}", nm_root.display()))?;
+        fs::create_dir_all(&nm_root).with_context(|| format!("create {}", nm_root.display()))?;
         for (dep, dep_version) in &all_deps {
             let target = store_package_path(cwd, dep, dep_version);
             let link_path = nm_root.join(dep);
@@ -3132,14 +4330,6 @@ fn install_from_lockfile(cwd: &Path, lockfile: &LockfileIn, _debug: bool, regist
                     .with_context(|| format!("symlink {}", link_path.display()))?;
             }
         }
-
-        // Link nested .bin entries
-        let bin_dir = nm_root.join(".bin");
-        for (dep, dep_version) in &all_deps {
-            let dep_pkg_dir = store_package_path(cwd, dep, dep_version);
-            let entries = read_package_bin_entries(&dep_pkg_dir)?;
-            link_bin_entries(&bin_dir, &entries)?;
-        }
     }
 
     // Link root dependencies
@@ -3148,13 +4338,20 @@ fn install_from_lockfile(cwd: &Path, lockfile: &LockfileIn, _debug: bool, regist
     let mut root_resolved = HashMap::new();
     if let Some(importers) = &lockfile.importers {
         if let Some(root) = importers.get(".") {
-            let all_lock_deps = [&root.dependencies, &root.dev_dependencies, &root.optional_dependencies];
+            let all_lock_deps = [
+                &root.dependencies,
+                &root.dev_dependencies,
+                &root.optional_dependencies,
+            ];
             for lock_deps in &all_lock_deps {
                 if let Some(map) = lock_deps {
                     for (name, dep) in map {
                         let version = match dep {
-                            ImporterDepIn::String(v) => v.clone(),
-                            ImporterDepIn::Object { version, .. } => version.clone().unwrap_or_default(),
+                            ImporterDepIn::String(v) => normalize_lockfile_version(v),
+                            ImporterDepIn::Object { version, .. } => version
+                                .as_deref()
+                                .map(normalize_lockfile_version)
+                                .unwrap_or_default(),
                         };
                         root_resolved.insert(name.clone(), version);
                     }
@@ -3162,12 +4359,13 @@ fn install_from_lockfile(cwd: &Path, lockfile: &LockfileIn, _debug: bool, regist
             }
         }
     }
-    for (name, _req) in deps.iter().chain(dev_deps.iter()).chain(optional_deps.iter()) {
+    for (name, _req) in deps
+        .iter()
+        .chain(dev_deps.iter())
+        .chain(optional_deps.iter())
+    {
         link_root_dep(cwd, name, &root_resolved)?;
     }
-
-    // Link root .bin entries
-    link_root_bin_entries(cwd, &root_resolved)?;
 
     write_modules_yaml(cwd, registry)?;
 
@@ -3186,7 +4384,8 @@ fn install_from_lockfile(cwd: &Path, lockfile: &LockfileIn, _debug: bool, regist
 }
 
 fn why_packages(cwd: &Path, targets: &[String]) -> Result<()> {
-    let lockfile_path = cwd.join("pnpm-lock.yaml");
+    let ctx = project_context(cwd)?;
+    let lockfile_path = ctx.workspace_root.join("pnpm-lock.yaml");
     if !lockfile_path.exists() {
         bail!("pnpm-lock.yaml not found; run pnpm-rs install first");
     }
@@ -3200,7 +4399,9 @@ fn why_packages(cwd: &Path, targets: &[String]) -> Result<()> {
 
     if let Some(snapshots) = &lockfile.snapshots {
         for (key, snapshot) in snapshots {
-            let Some((name, version)) = parse_lockfile_key(key) else { continue };
+            let Some((name, version)) = parse_lockfile_key(key) else {
+                continue;
+            };
             name_to_versions
                 .entry(name.clone())
                 .or_default()
@@ -3223,7 +4424,9 @@ fn why_packages(cwd: &Path, targets: &[String]) -> Result<()> {
         }
     } else if let Some(packages) = &lockfile.packages {
         for (key, snapshot) in packages {
-            let Some((name, version)) = parse_lockfile_key(key) else { continue };
+            let Some((name, version)) = parse_lockfile_key(key) else {
+                continue;
+            };
             name_to_versions
                 .entry(name.clone())
                 .or_default()
@@ -3248,7 +4451,7 @@ fn why_packages(cwd: &Path, targets: &[String]) -> Result<()> {
 
     let mut root_deps = HashMap::new();
     if let Some(importers) = &lockfile.importers {
-        if let Some(importer) = importers.get(".") {
+        if let Some(importer) = importers.get(&ctx.importer) {
             if let Some(deps) = &importer.dependencies {
                 root_deps.extend(importer_dep_versions(deps));
             }
@@ -3317,10 +4520,16 @@ fn parse_lockfile_key(key: &str) -> Option<(String, String)> {
         let slash_idx = trimmed.find('/')?;
         let after = &trimmed[slash_idx + 1..];
         let at_idx = after.find('@')? + slash_idx + 1;
-        (trimmed[..at_idx].to_string(), trimmed[at_idx + 1..].to_string())
+        (
+            trimmed[..at_idx].to_string(),
+            trimmed[at_idx + 1..].to_string(),
+        )
     } else {
         let at_idx = trimmed.find('@')?;
-        (trimmed[..at_idx].to_string(), trimmed[at_idx + 1..].to_string())
+        (
+            trimmed[..at_idx].to_string(),
+            trimmed[at_idx + 1..].to_string(),
+        )
     };
     let version = rest.split('(').next().unwrap_or("").trim();
     if name.is_empty() || version.is_empty() {
@@ -3329,10 +4538,7 @@ fn parse_lockfile_key(key: &str) -> Option<(String, String)> {
     Some((name, version.to_string()))
 }
 
-fn find_path_to_root(
-    target: &str,
-    reverse: &HashMap<String, Vec<String>>,
-) -> Option<Vec<String>> {
+fn find_path_to_root(target: &str, reverse: &HashMap<String, Vec<String>>) -> Option<Vec<String>> {
     let mut queue = VecDeque::new();
     let mut parent: HashMap<String, String> = HashMap::new();
     queue.push_back(target.to_string());
@@ -3372,16 +4578,25 @@ fn importer_dep_versions(deps: &HashMap<String, ImporterDepIn>) -> HashMap<Strin
     for (name, dep) in deps {
         match dep {
             ImporterDepIn::String(value) => {
-                out.insert(name.clone(), value.clone());
+                out.insert(name.clone(), normalize_lockfile_version(value));
             }
             ImporterDepIn::Object { version, .. } => {
                 if let Some(ver) = version {
-                    out.insert(name.clone(), ver.clone());
+                    out.insert(name.clone(), normalize_lockfile_version(ver));
                 }
             }
         }
     }
     out
+}
+
+fn normalize_lockfile_version(version: &str) -> String {
+    version
+        .split('(')
+        .next()
+        .unwrap_or(version)
+        .trim()
+        .to_string()
 }
 
 #[cfg(test)]
@@ -3405,7 +4620,11 @@ mod tests {
 
     #[test]
     fn tarball_url_rejects_untrusted_or_insecure_hosts() {
-        assert!(ensure_trusted_tarball_url("http://registry.npmjs.org/react/-/react-1.0.0.tgz", None).is_err());
+        assert!(ensure_trusted_tarball_url(
+            "http://registry.npmjs.org/react/-/react-1.0.0.tgz",
+            None
+        )
+        .is_err());
         assert!(ensure_trusted_tarball_url("https://example.com/react.tgz", None).is_err());
     }
 
@@ -3452,16 +4671,34 @@ mod tests {
     fn format_save_version_uses_caret_by_default() {
         assert_eq!(format_save_version(None, "1.2.3", false), "^1.2.3");
         assert_eq!(format_save_version(Some("19"), "19.0.0", false), "^19.0.0");
-        assert_eq!(format_save_version(Some("react"), "19.0.0", false), "^19.0.0");
+        assert_eq!(
+            format_save_version(Some("react"), "19.0.0", false),
+            "^19.0.0"
+        );
     }
 
     #[test]
     fn format_save_version_preserves_explicit_ranges() {
-        assert_eq!(format_save_version(Some("^1.0.0"), "1.2.3", false), "^1.0.0");
-        assert_eq!(format_save_version(Some("~1.0.0"), "1.0.5", false), "~1.0.0");
-        assert_eq!(format_save_version(Some(">=1.0.0"), "1.2.3", false), ">=1.0.0");
-        assert_eq!(format_save_version(Some("1.0.0 - 2.0.0"), "1.5.0", false), "1.0.0 - 2.0.0");
-        assert_eq!(format_save_version(Some("^1.0.0 || ^2.0.0"), "2.1.0", false), "^1.0.0 || ^2.0.0");
+        assert_eq!(
+            format_save_version(Some("^1.0.0"), "1.2.3", false),
+            "^1.0.0"
+        );
+        assert_eq!(
+            format_save_version(Some("~1.0.0"), "1.0.5", false),
+            "~1.0.0"
+        );
+        assert_eq!(
+            format_save_version(Some(">=1.0.0"), "1.2.3", false),
+            ">=1.0.0"
+        );
+        assert_eq!(
+            format_save_version(Some("1.0.0 - 2.0.0"), "1.5.0", false),
+            "1.0.0 - 2.0.0"
+        );
+        assert_eq!(
+            format_save_version(Some("^1.0.0 || ^2.0.0"), "2.1.0", false),
+            "^1.0.0 || ^2.0.0"
+        );
     }
 
     #[test]
@@ -3478,10 +4715,17 @@ mod tests {
             "optionalDependencies": { "fsevents": "^2.0.0" }
         });
         let opts = ListOptions {
-            json: false, long: false, parseable: false,
-            prod: false, dev: false, optional: false,
-            only: None, global: false, recursive: false,
-            depth: None, packages: vec![],
+            json: false,
+            long: false,
+            parseable: false,
+            prod: false,
+            dev: false,
+            optional: false,
+            only: None,
+            global: false,
+            recursive: false,
+            depth: None,
+            packages: vec![],
         };
         let result = collect_requested_deps(&manifest, &opts).unwrap();
         let names: Vec<&str> = result.iter().map(|(n, _)| n.as_str()).collect();
@@ -3498,10 +4742,17 @@ mod tests {
             "optionalDependencies": { "fsevents": "^2.0.0" }
         });
         let opts = ListOptions {
-            json: false, long: false, parseable: false,
-            prod: true, dev: false, optional: false,
-            only: None, global: false, recursive: false,
-            depth: None, packages: vec![],
+            json: false,
+            long: false,
+            parseable: false,
+            prod: true,
+            dev: false,
+            optional: false,
+            only: None,
+            global: false,
+            recursive: false,
+            depth: None,
+            packages: vec![],
         };
         let result = collect_requested_deps(&manifest, &opts).unwrap();
         let names: Vec<&str> = result.iter().map(|(n, _)| n.as_str()).collect();
@@ -3542,7 +4793,11 @@ mod tests {
     #[test]
     fn parse_npmrc_reads_registry_line() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join(".npmrc"), "registry=https://npm.example.com/\n").unwrap();
+        fs::write(
+            dir.path().join(".npmrc"),
+            "registry=https://npm.example.com/\n",
+        )
+        .unwrap();
         let result = parse_npmrc(dir.path()).unwrap();
         assert_eq!(result.unwrap(), "https://npm.example.com/");
     }
@@ -3550,27 +4805,27 @@ mod tests {
     #[test]
     fn parse_npmrc_ignores_comments() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join(".npmrc"), "# registry=https://bad.com/\nregistry=https://good.com/\n").unwrap();
+        fs::write(
+            dir.path().join(".npmrc"),
+            "# registry=https://bad.com/\nregistry=https://good.com/\n",
+        )
+        .unwrap();
         let result = parse_npmrc(dir.path()).unwrap();
         assert_eq!(result.unwrap(), "https://good.com/");
     }
 
     #[test]
-    fn read_package_bin_entries_handles_string_bin() {
-        let dir = tempfile::tempdir().unwrap();
+    fn blocked_bin_names_handles_string_bin() {
         let manifest = serde_json::json!({
             "name": "my-tool",
             "bin": "./cli.js"
         });
-        fs::write(dir.path().join("package.json"), serde_json::to_string(&manifest).unwrap()).unwrap();
-        let entries = read_package_bin_entries(dir.path()).unwrap();
-        assert_eq!(entries.len(), 1);
-        assert!(entries.contains_key("my-tool"));
+        let bins = blocked_bin_names(&manifest);
+        assert_eq!(bins, vec!["my-tool"]);
     }
 
     #[test]
-    fn read_package_bin_entries_handles_object_bin() {
-        let dir = tempfile::tempdir().unwrap();
+    fn blocked_bin_names_handles_object_bin() {
         let manifest = serde_json::json!({
             "name": "multi-tool",
             "bin": {
@@ -3578,22 +4833,128 @@ mod tests {
                 "cmd2": "./bin/cmd2.js"
             }
         });
-        fs::write(dir.path().join("package.json"), serde_json::to_string(&manifest).unwrap()).unwrap();
-        let entries = read_package_bin_entries(dir.path()).unwrap();
-        assert_eq!(entries.len(), 2);
-        assert!(entries.contains_key("cmd1"));
-        assert!(entries.contains_key("cmd2"));
+        let bins = blocked_bin_names(&manifest);
+        assert_eq!(bins, vec!["cmd1", "cmd2"]);
     }
 
     #[test]
-    fn read_package_bin_entries_rejects_parent_dir() {
-        let dir = tempfile::tempdir().unwrap();
+    fn blocked_bin_names_ignores_invalid_shapes() {
         let manifest = serde_json::json!({
-            "name": "evil",
-            "bin": "../../../etc/passwd"
+            "name": "tool",
+            "bin": ["./bin/tool.js"]
         });
-        fs::write(dir.path().join("package.json"), serde_json::to_string(&manifest).unwrap()).unwrap();
-        assert!(read_package_bin_entries(dir.path()).is_err());
+        let bins = blocked_bin_names(&manifest);
+        assert!(bins.is_empty());
+    }
+
+    #[test]
+    fn describe_lifecycle_script_explains_husky_dependency() {
+        let dir = tempfile::tempdir().unwrap();
+        let husky_dir = dir.path().join("node_modules").join("husky");
+        fs::create_dir_all(&husky_dir).unwrap();
+        fs::write(
+            husky_dir.join("package.json"),
+            serde_json::to_string(&serde_json::json!({
+                "name": "husky",
+                "description": "Modern native Git hooks",
+                "bin": {
+                    "husky": "bin.js"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let manifest = serde_json::json!({
+            "devDependencies": {
+                "husky": "^9.0.0"
+            }
+        });
+        let obj = manifest.as_object().unwrap();
+        let details = describe_lifecycle_script(obj, "husky", Some(dir.path()));
+
+        assert!(details
+            .iter()
+            .any(|line| line.contains("starts by invoking command `husky`")));
+        assert!(details
+            .iter()
+            .any(|line| line
+                .contains("command matches declared dependency `husky` in devDependencies")));
+        assert!(details
+            .iter()
+            .any(|line| line.contains("local package exports binary `husky` -> `bin.js`")));
+        assert!(details
+            .iter()
+            .any(|line| line
+                .contains("common behavior: typically installs or updates Git hook scripts")));
+    }
+
+    #[test]
+    fn describe_lifecycle_script_flags_multiple_commands() {
+        let manifest = serde_json::json!({
+            "dependencies": {
+                "left-pad": "^1.0.0"
+            }
+        });
+        let obj = manifest.as_object().unwrap();
+        let details = describe_lifecycle_script(
+            obj,
+            "NODE_ENV=production node ./scripts/setup.js && husky",
+            None,
+        );
+
+        assert!(details
+            .iter()
+            .any(|line| line.contains("uses shell syntax and may invoke multiple commands")));
+        assert!(details
+            .iter()
+            .any(|line| line.contains("invokes commands in sequence: `node`, `husky`")));
+        assert!(details
+            .iter()
+            .any(|line| line.contains("for `node`: starts by invoking the Node.js interpreter")));
+    }
+
+    #[test]
+    fn describe_lifecycle_script_reports_local_script_source_signals() {
+        let dir = tempfile::tempdir().unwrap();
+        let scripts_dir = dir.path().join("scripts");
+        fs::create_dir_all(&scripts_dir).unwrap();
+        fs::write(
+            scripts_dir.join("postinstall.js"),
+            r#"
+                const fs = require("fs");
+                const { execSync } = require("child_process");
+                const https = require("https");
+                execSync("echo test");
+                fs.writeFileSync("out.txt", "data");
+                https.request("https://example.com");
+                console.log(process.env.HOME);
+            "#,
+        )
+        .unwrap();
+
+        let manifest = serde_json::json!({});
+        let obj = manifest.as_object().unwrap();
+        let details =
+            describe_lifecycle_script(obj, "node scripts/postinstall.js", Some(dir.path()));
+
+        assert!(details
+            .iter()
+            .any(|line| line.contains("node target: `scripts/postinstall.js`")));
+        assert!(details.iter().any(|line| line
+            .contains("likely action: inspects local script target `scripts/postinstall.js`")));
+        assert!(details
+            .iter()
+            .any(|line| line.contains("spawns subprocesses")));
+        assert!(details
+            .iter()
+            .any(|line| line.contains("accesses the network")));
+        assert!(details
+            .iter()
+            .any(|line| line.contains("modifies local files")));
+        assert!(details
+            .iter()
+            .any(|line| line.contains("reads environment variables")));
     }
 
     #[test]
@@ -3619,10 +4980,127 @@ mod tests {
     }
 
     #[test]
+    fn ensure_isolated_no_deps_manifest_allows_target_replacement() {
+        let manifest = serde_json::json!({
+            "dependencies": {
+                "react": "^18.0.0"
+            }
+        });
+        let specs = vec![PackageSpec {
+            name: "react".to_string(),
+            requested: Some("19".to_string()),
+        }];
+
+        ensure_isolated_no_deps_manifest(&manifest, &specs, DepSection::Dependencies).unwrap();
+    }
+
+    #[test]
+    fn ensure_isolated_no_deps_manifest_rejects_other_root_dependencies() {
+        let manifest = serde_json::json!({
+            "dependencies": {
+                "react": "^18.0.0",
+                "lodash": "^4.17.21"
+            },
+            "devDependencies": {
+                "typescript": "^5.0.0"
+            }
+        });
+        let specs = vec![PackageSpec {
+            name: "react".to_string(),
+            requested: Some("19".to_string()),
+        }];
+
+        let err = ensure_isolated_no_deps_manifest(&manifest, &specs, DepSection::Dependencies)
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("--no-deps only supports isolated analysis projects"));
+        assert!(message.contains("dependencies.lodash"));
+        assert!(message.contains("devDependencies.typescript"));
+    }
+
+    #[test]
+    fn build_top_level_only_result_omits_transitive_dependencies() {
+        let specs = vec![PackageSpec {
+            name: "react".to_string(),
+            requested: Some("19".to_string()),
+        }];
+        let root_resolved = HashMap::from([("react".to_string(), "19.2.0".to_string())]);
+        let metadata = HashMap::from([(
+            "react".to_string(),
+            RegistryPackage {
+                versions: HashMap::from([(
+                    "19.2.0".to_string(),
+                    RegistryVersion {
+                        dependencies: Some(HashMap::from([(
+                            "loose-envify".to_string(),
+                            "^1.1.0".to_string(),
+                        )])),
+                        optional_dependencies: Some(HashMap::from([(
+                            "optional-dep".to_string(),
+                            "^1.0.0".to_string(),
+                        )])),
+                        peer_dependencies: Some(HashMap::from([(
+                            "react-dom".to_string(),
+                            "^19.2.0".to_string(),
+                        )])),
+                        peer_dependencies_meta: None,
+                        engines: None,
+                        has_bin: Some(false),
+                        dist: RegistryDist {
+                            tarball: "https://registry.npmjs.org/react/-/react-19.2.0.tgz"
+                                .to_string(),
+                            integrity: Some("sha512-deadbeef".to_string()),
+                            shasum: None,
+                        },
+                    },
+                )]),
+                dist_tags: HashMap::from([("latest".to_string(), "19.2.0".to_string())]),
+                time: None,
+            },
+        )]);
+
+        let resolved = build_top_level_only_result(&specs, root_resolved, metadata).unwrap();
+        let node = resolved.nodes.get("react@19.2.0").unwrap();
+        assert!(node.dependencies.is_empty());
+        assert!(node.optional_dependencies.is_empty());
+        assert!(node.peer_dependencies.is_empty());
+        assert_eq!(resolved.root_resolved.get("react").unwrap(), "19.2.0");
+    }
+
+    #[test]
     fn parse_package_spec_strips_npm_prefix() {
         let spec = parse_package_spec("npm:react@19").unwrap();
         assert_eq!(spec.name, "react");
         assert_eq!(spec.requested.unwrap(), "19");
+    }
+
+    #[test]
+    fn workspace_importer_name_uses_relative_posix_path() {
+        let root = Path::new("/tmp/workspace");
+        let importer =
+            workspace_importer_name(root, Path::new("/tmp/workspace/packages/app")).unwrap();
+        assert_eq!(importer, "packages/app");
+    }
+
+    #[test]
+    fn normalize_lockfile_version_strips_peer_suffix() {
+        assert_eq!(normalize_lockfile_version("18.2.0(react@18.2.0)"), "18.2.0");
+    }
+
+    #[test]
+    fn locate_store_package_path_finds_peer_variant_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let peer_variant = dir
+            .path()
+            .join("node_modules")
+            .join(".pnpm")
+            .join("react-dom@18.2.0_react@18.2.0")
+            .join("node_modules")
+            .join("react-dom");
+        fs::create_dir_all(&peer_variant).unwrap();
+
+        let resolved = locate_store_package_path(dir.path(), "react-dom", "18.2.0");
+        assert_eq!(resolved, peer_variant);
     }
 
     #[test]
@@ -3635,42 +5113,64 @@ mod tests {
     #[test]
     fn lockfile_satisfies_manifest_rejects_mismatched_specifiers() {
         let mut deps = HashMap::new();
-        deps.insert("react".to_string(), ImporterDepIn::Object {
-            specifier: Some("^18.0.0".to_string()),
-            version: Some("18.2.0".to_string()),
-        });
+        deps.insert(
+            "react".to_string(),
+            ImporterDepIn::Object {
+                specifier: Some("^18.0.0".to_string()),
+                version: Some("18.2.0".to_string()),
+            },
+        );
         let lockfile = LockfileIn {
-            importers: Some(HashMap::from([(".".to_string(), ImporterIn {
-                dependencies: Some(deps),
-                dev_dependencies: None,
-                optional_dependencies: None,
-            })])),
+            importers: Some(HashMap::from([(
+                ".".to_string(),
+                ImporterIn {
+                    dependencies: Some(deps),
+                    dev_dependencies: None,
+                    optional_dependencies: None,
+                },
+            )])),
             packages: None,
             snapshots: None,
         };
         let manifest_deps = HashMap::from([("react".to_string(), "^19.0.0".to_string())]);
         let empty = HashMap::new();
-        assert!(!lockfile_satisfies_manifest(&lockfile, &manifest_deps, &empty, &empty));
+        assert!(!lockfile_satisfies_manifest(
+            &lockfile,
+            &manifest_deps,
+            &empty,
+            &empty
+        ));
     }
 
     #[test]
     fn lockfile_satisfies_manifest_accepts_matching_specifiers() {
         let mut deps = HashMap::new();
-        deps.insert("react".to_string(), ImporterDepIn::Object {
-            specifier: Some("^19.0.0".to_string()),
-            version: Some("19.0.0".to_string()),
-        });
+        deps.insert(
+            "react".to_string(),
+            ImporterDepIn::Object {
+                specifier: Some("^19.0.0".to_string()),
+                version: Some("19.0.0".to_string()),
+            },
+        );
         let lockfile = LockfileIn {
-            importers: Some(HashMap::from([(".".to_string(), ImporterIn {
-                dependencies: Some(deps),
-                dev_dependencies: None,
-                optional_dependencies: None,
-            })])),
+            importers: Some(HashMap::from([(
+                ".".to_string(),
+                ImporterIn {
+                    dependencies: Some(deps),
+                    dev_dependencies: None,
+                    optional_dependencies: None,
+                },
+            )])),
             packages: None,
             snapshots: None,
         };
         let manifest_deps = HashMap::from([("react".to_string(), "^19.0.0".to_string())]);
         let empty = HashMap::new();
-        assert!(lockfile_satisfies_manifest(&lockfile, &manifest_deps, &empty, &empty));
+        assert!(lockfile_satisfies_manifest(
+            &lockfile,
+            &manifest_deps,
+            &empty,
+            &empty
+        ));
     }
 }

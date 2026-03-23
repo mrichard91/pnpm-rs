@@ -1,5 +1,6 @@
 # ---- Rust / Cargo ----
 /target/
+/.docker-bin/
 **/*.rs.bk
 
 # ---- Cargo lock (binary vs library) ----
@@ -27,6 +28,6 @@ Thumbs.db
 
 # ---- Coverage / profiling ----
 /coverage/
+/artifacts/
 /tarpaulin-report.html
 *.profraw
-

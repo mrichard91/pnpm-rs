@@ -1,7 +1,7 @@
-use std::fs;
 use anyhow::{Context, Result};
 use assert_cmd::cargo::cargo_bin_cmd;
 use assert_fs::TempDir;
+use std::fs;
 
 #[test]
 fn add_package_in_existing_project() -> Result<()> {
@@ -20,7 +20,11 @@ fn add_package_in_existing_project() -> Result<()> {
     cmd.current_dir(temp.path()).arg("add").arg("react@19");
     cmd.assert().success();
 
-    let react_manifest = temp.path().join("node_modules").join("react").join("package.json");
+    let react_manifest = temp
+        .path()
+        .join("node_modules")
+        .join("react")
+        .join("package.json");
     assert!(react_manifest.exists(), "react package.json should exist");
     let pnpm_store = temp.path().join("node_modules").join(".pnpm");
     assert!(pnpm_store.exists(), ".pnpm store should exist");
@@ -44,13 +48,14 @@ fn init_and_add_package() -> Result<()> {
     assert!(contents.contains("\"name\""));
 
     let mut add_cmd = cargo_bin_cmd!("pnpm-rs");
-    add_cmd
-        .current_dir(temp.path())
-        .arg("add")
-        .arg("react@19");
+    add_cmd.current_dir(temp.path()).arg("add").arg("react@19");
     add_cmd.assert().success();
 
-    let react_manifest = temp.path().join("node_modules").join("react").join("package.json");
+    let react_manifest = temp
+        .path()
+        .join("node_modules")
+        .join("react")
+        .join("package.json");
     assert!(react_manifest.exists(), "react package.json should exist");
     Ok(())
 }
@@ -85,10 +90,7 @@ fn why_reports_direct_dependency() -> Result<()> {
     )?;
 
     let mut add_cmd = cargo_bin_cmd!("pnpm-rs");
-    add_cmd
-        .current_dir(temp.path())
-        .arg("add")
-        .arg("react@19");
+    add_cmd.current_dir(temp.path()).arg("add").arg("react@19");
     add_cmd.assert().success();
 
     let mut why_cmd = cargo_bin_cmd!("pnpm-rs");
@@ -117,10 +119,7 @@ fn ls_aliases_list() -> Result<()> {
     )?;
 
     let mut add_cmd = cargo_bin_cmd!("pnpm-rs");
-    add_cmd
-        .current_dir(temp.path())
-        .arg("add")
-        .arg("react@19");
+    add_cmd.current_dir(temp.path()).arg("add").arg("react@19");
     add_cmd.assert().success();
 
     let mut list_cmd = cargo_bin_cmd!("pnpm-rs");
@@ -226,7 +225,10 @@ fn add_writes_caret_range() -> Result<()> {
     let contents = fs::read_to_string(temp.path().join("package.json"))?;
     let parsed: serde_json::Value = serde_json::from_str(&contents)?;
     let react_version = parsed["dependencies"]["react"].as_str().unwrap();
-    assert!(react_version.starts_with('^'), "expected caret range, got {react_version}");
+    assert!(
+        react_version.starts_with('^'),
+        "expected caret range, got {react_version}"
+    );
     Ok(())
 }
 
@@ -244,13 +246,46 @@ fn add_save_exact_writes_plain_version() -> Result<()> {
     )?;
 
     let mut cmd = cargo_bin_cmd!("pnpm-rs");
-    cmd.current_dir(temp.path()).arg("add").arg("--save-exact").arg("react@19");
+    cmd.current_dir(temp.path())
+        .arg("add")
+        .arg("--save-exact")
+        .arg("react@19");
     cmd.assert().success();
 
     let contents = fs::read_to_string(temp.path().join("package.json"))?;
     let parsed: serde_json::Value = serde_json::from_str(&contents)?;
     let react_version = parsed["dependencies"]["react"].as_str().unwrap();
-    assert!(!react_version.starts_with('^'), "expected exact version, got {react_version}");
+    assert!(
+        !react_version.starts_with('^'),
+        "expected exact version, got {react_version}"
+    );
+    Ok(())
+}
+
+#[test]
+fn add_no_deps_rejects_existing_root_dependencies() -> Result<()> {
+    let temp = TempDir::new()?;
+    let package_json = serde_json::json!({
+        "name": "analysis-project",
+        "version": "1.0.0",
+        "private": true,
+        "dependencies": {
+            "lodash": "^4.17.21"
+        }
+    });
+    fs::write(
+        temp.path().join("package.json"),
+        serde_json::to_string_pretty(&package_json)? + "\n",
+    )?;
+
+    let mut cmd = cargo_bin_cmd!("pnpm-rs");
+    cmd.current_dir(temp.path())
+        .arg("add")
+        .arg("--no-deps")
+        .arg("react@19");
+    cmd.assert().failure().stderr(predicates::str::contains(
+        "--no-deps only supports isolated analysis projects",
+    ));
     Ok(())
 }
 
@@ -268,13 +303,22 @@ fn add_save_dev_writes_to_dev_dependencies() -> Result<()> {
     )?;
 
     let mut cmd = cargo_bin_cmd!("pnpm-rs");
-    cmd.current_dir(temp.path()).arg("add").arg("--save-dev").arg("react@19");
+    cmd.current_dir(temp.path())
+        .arg("add")
+        .arg("--save-dev")
+        .arg("react@19");
     cmd.assert().success();
 
     let contents = fs::read_to_string(temp.path().join("package.json"))?;
     let parsed: serde_json::Value = serde_json::from_str(&contents)?;
-    assert!(parsed["devDependencies"]["react"].is_string(), "expected react in devDependencies");
-    assert!(parsed["dependencies"]["react"].is_null(), "expected react NOT in dependencies");
+    assert!(
+        parsed["devDependencies"]["react"].is_string(),
+        "expected react in devDependencies"
+    );
+    assert!(
+        parsed["dependencies"]["react"].is_null(),
+        "expected react NOT in dependencies"
+    );
     Ok(())
 }
 
@@ -293,7 +337,9 @@ fn frozen_lockfile_fails_without_lockfile() -> Result<()> {
     )?;
 
     let mut cmd = cargo_bin_cmd!("pnpm-rs");
-    cmd.current_dir(temp.path()).arg("--frozen-lockfile").arg("install");
+    cmd.current_dir(temp.path())
+        .arg("--frozen-lockfile")
+        .arg("install");
     cmd.assert()
         .failure()
         .stderr(predicates::str::contains("no lockfile found"));
@@ -301,7 +347,7 @@ fn frozen_lockfile_fails_without_lockfile() -> Result<()> {
 }
 
 #[test]
-fn lockfile_install_creates_bin_links() -> Result<()> {
+fn install_blocks_bin_links() -> Result<()> {
     let temp = TempDir::new()?;
     let package_json = serde_json::json!({
         "name": "bin-project",
@@ -319,7 +365,34 @@ fn lockfile_install_creates_bin_links() -> Result<()> {
     cmd.assert().success();
 
     let bin_dir = temp.path().join("node_modules").join(".bin");
-    let semver_bin = bin_dir.join("semver");
-    assert!(semver_bin.exists() || bin_dir.exists(), "node_modules/.bin directory should exist after adding a package with bin");
+    assert!(
+        !bin_dir.exists(),
+        "safe mode should not create node_modules/.bin"
+    );
+    Ok(())
+}
+
+#[test]
+fn install_rejects_workspace_mutation() -> Result<()> {
+    let temp = TempDir::new()?;
+    fs::write(
+        temp.path().join("pnpm-workspace.yaml"),
+        "packages:\n  - packages/*\n",
+    )?;
+    let package_json = serde_json::json!({
+        "name": "workspace-root",
+        "version": "1.0.0",
+        "private": true
+    });
+    fs::write(
+        temp.path().join("package.json"),
+        serde_json::to_string_pretty(&package_json)? + "\n",
+    )?;
+
+    let mut cmd = cargo_bin_cmd!("pnpm-rs");
+    cmd.current_dir(temp.path()).arg("install");
+    cmd.assert().failure().stderr(predicates::str::contains(
+        "mutating commands are disabled inside pnpm workspaces",
+    ));
     Ok(())
 }

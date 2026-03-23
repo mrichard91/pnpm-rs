@@ -1,0 +1,28 @@
+FROM rust:1-bookworm AS builder
+
+WORKDIR /src
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends clang libclang-dev pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+
+RUN cargo build --release --bin pnpm-rs --bin pnpm-rs-pre-scan
+
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --create-home --uid 10001 appuser
+
+WORKDIR /work
+
+COPY --from=builder /src/target/release/pnpm-rs /usr/local/bin/pnpm-rs
+COPY --from=builder /src/target/release/pnpm-rs-pre-scan /usr/local/bin/pnpm-rs-pre-scan
+
+USER appuser
+
+ENTRYPOINT ["/usr/local/bin/pnpm-rs-pre-scan"]
