@@ -14,11 +14,14 @@ use reqwest::blocking::Client;
 use reqwest::Url;
 use semver::Version;
 use serde::Deserialize;
+use serde_json::Value as JsonValue;
 use tempfile::TempDir;
 
 const NPM_REPLICATE_ALL_DOCS: &str = "https://replicate.npmjs.com/_all_docs";
+const NPM_REPLICATE_CHANGES: &str = "https://replicate.npmjs.com/registry/_changes";
 const NPM_REGISTRY_METADATA_API: &str = "https://registry.npmjs.org/";
 const NPM_SEARCH_API: &str = "https://registry.npmjs.org/-/v1/search";
+const CHANGES_PAGE_SIZE: usize = 1000;
 const SCOPE_PAGE_SIZE: usize = 500;
 const SEARCH_PAGE_SIZE: usize = 250;
 
@@ -59,7 +62,7 @@ fn main() -> Result<()> {
     if selector_mode.is_some() {
         if !cli.no_deps {
             bail!(
-                "pnpm-rs-pre-scan: --no-deps is required for scope wildcard, maintainer, and all-versions scans"
+                "pnpm-rs-pre-scan: --no-deps is required for scope wildcard, maintainer, all-versions, and changes-since scans"
             );
         }
         if cli.inspect_shell && packages.len() != 1 {
@@ -149,6 +152,17 @@ struct SearchPackage {
 }
 
 #[derive(Deserialize)]
+struct ChangesResponse {
+    results: Vec<ChangesRow>,
+    last_seq: JsonValue,
+}
+
+#[derive(Deserialize)]
+struct ChangesRow {
+    id: String,
+}
+
+#[derive(Deserialize)]
 struct RegistryMetadataDocument {
     versions: HashMap<String, RegistryVersionMarker>,
     time: Option<HashMap<String, String>>,
@@ -213,6 +227,7 @@ enum ScanSelectorKind {
     ScopeWildcard,
     Maintainer,
     AllVersions,
+    ChangesSince,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -551,6 +566,7 @@ fn expand_scan_targets(spec: &str, debug: bool) -> Result<Vec<String>> {
         Some(ScanSelectorKind::ScopeWildcard) => list_scoped_packages(spec, debug),
         Some(ScanSelectorKind::Maintainer) => list_maintainer_packages(spec, debug),
         Some(ScanSelectorKind::AllVersions) => list_package_versions(spec, debug),
+        Some(ScanSelectorKind::ChangesSince) => list_changed_packages_since(spec, debug),
         None => Ok(vec![spec.to_string()]),
     }
 }
@@ -564,6 +580,9 @@ fn scan_selector_kind(spec: &str) -> Option<ScanSelectorKind> {
     }
     if all_versions_selector(spec).is_some() {
         return Some(ScanSelectorKind::AllVersions);
+    }
+    if changes_since_selector(spec).is_some() {
+        return Some(ScanSelectorKind::ChangesSince);
     }
     None
 }
@@ -704,6 +723,60 @@ fn list_package_versions(spec: &str, debug: bool) -> Result<Vec<String>> {
         .collect())
 }
 
+fn list_changed_packages_since(spec: &str, debug: bool) -> Result<Vec<String>> {
+    let since = changes_since_selector(spec)
+        .ok_or_else(|| anyhow!("invalid changes-since selector: {spec}"))?;
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .context("build http client")?;
+    let mut packages = BTreeSet::new();
+    let mut next_since = since;
+
+    loop {
+        let mut url = Url::parse(NPM_REPLICATE_CHANGES).context("parse changes endpoint")?;
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("since", &next_since);
+            query.append_pair("limit", &CHANGES_PAGE_SIZE.to_string());
+        }
+        if debug {
+            eprintln!("pnpm-rs-pre-scan debug: GET {url}");
+        }
+        let response = client
+            .get(url)
+            .header("User-Agent", "pnpm-rs-pre-scan")
+            .send()
+            .context("fetch changed package list")?;
+        if !response.status().is_success() {
+            bail!("changed package list query failed: {}", response.status());
+        }
+        let payload: ChangesResponse = response.json().context("parse changed package list")?;
+        if payload.results.is_empty() {
+            break;
+        }
+        let page_size = payload.results.len();
+        for row in payload.results {
+            if is_valid_package_name(&row.id) {
+                packages.insert(row.id);
+            }
+        }
+        let last_seq = changes_seq_token(&payload.last_seq);
+        if last_seq == next_since {
+            break;
+        }
+        next_since = last_seq;
+        if page_size < CHANGES_PAGE_SIZE {
+            break;
+        }
+    }
+
+    if packages.is_empty() {
+        bail!("no packages found for changes-since selector {spec}");
+    }
+    Ok(packages.into_iter().collect())
+}
+
 fn wildcard_scope_prefix(spec: &str) -> Option<String> {
     let trimmed = spec.trim();
     let raw_scope = trimmed.strip_suffix("/*")?;
@@ -757,6 +830,22 @@ fn all_versions_selector(spec: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+fn changes_since_selector(spec: &str) -> Option<String> {
+    let trimmed = spec.trim();
+    let since = trimmed
+        .strip_prefix("changes-since:")
+        .or_else(|| trimmed.strip_prefix("changed-since:"))?
+        .trim();
+    if since.is_empty()
+        || since
+            .chars()
+            .any(|ch| ch.is_control() || ch.is_whitespace())
+    {
+        return None;
+    }
+    Some(since.to_string())
 }
 
 fn normalize_maintainer_username(value: &str) -> Option<String> {
@@ -843,6 +932,14 @@ fn fetch_registry_metadata_document(
     response
         .json()
         .with_context(|| format!("parse package metadata for {package}"))
+}
+
+fn changes_seq_token(value: &JsonValue) -> String {
+    match value {
+        JsonValue::String(value) => value.clone(),
+        JsonValue::Number(value) => value.to_string(),
+        _ => value.to_string(),
+    }
 }
 
 fn sorted_registry_versions(metadata: &RegistryMetadataDocument) -> Vec<String> {
@@ -1424,11 +1521,13 @@ fn relative_path_between(from: &std::path::Path, to: &std::path::Path) -> Option
 mod tests {
     use super::{
         aggregate_scan_results, all_versions_selector, artifact_dir_name, build_add_args,
-        copy_tree, maintainer_selector, normalize_scan_summary_paths, relative_path_between,
-        sanitize_artifact_component, sorted_registry_versions, wildcard_scope_prefix, PackageLog,
-        PackageScanOutcome, RegistryMetadataDocument, RegistryVersionMarker, ScanFailure,
-        SecurityScanSummary, SecurityScanYaraMatch, SecurityScanYaraSummary,
+        changes_seq_token, changes_since_selector, copy_tree, maintainer_selector,
+        normalize_scan_summary_paths, relative_path_between, sanitize_artifact_component,
+        sorted_registry_versions, wildcard_scope_prefix, PackageLog, PackageScanOutcome,
+        RegistryMetadataDocument, RegistryVersionMarker, ScanFailure, SecurityScanSummary,
+        SecurityScanYaraMatch, SecurityScanYaraSummary,
     };
+    use serde_json::json;
     use std::collections::HashMap;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1537,6 +1636,24 @@ mod tests {
         assert!(all_versions_selector("versions:react@19").is_none());
         assert!(all_versions_selector("all-versions:OpenGov").is_none());
         assert!(all_versions_selector("all-versions:@scope").is_none());
+    }
+
+    #[test]
+    fn changes_since_selector_accepts_sequence_tokens() {
+        assert_eq!(
+            changes_since_selector("changes-since:12345").as_deref(),
+            Some("12345")
+        );
+        assert_eq!(
+            changes_since_selector("changed-since:17-g1AAAA").as_deref(),
+            Some("17-g1AAAA")
+        );
+    }
+
+    #[test]
+    fn changes_since_selector_rejects_empty_or_whitespace_values() {
+        assert!(changes_since_selector("changes-since:").is_none());
+        assert!(changes_since_selector("changes-since:abc def").is_none());
     }
 
     #[test]
@@ -1691,6 +1808,12 @@ mod tests {
                 "2.0.0".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn changes_seq_token_handles_numeric_and_string_values() {
+        assert_eq!(changes_seq_token(&json!(12345)), "12345");
+        assert_eq!(changes_seq_token(&json!("17-g1AAAA")), "17-g1AAAA");
     }
 
     #[test]
