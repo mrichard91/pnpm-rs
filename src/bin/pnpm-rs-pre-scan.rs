@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -8,13 +8,16 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
+use chrono::{DateTime, Utc};
 use clap::Parser;
 use reqwest::blocking::Client;
 use reqwest::Url;
+use semver::Version;
 use serde::Deserialize;
 use tempfile::TempDir;
 
 const NPM_REPLICATE_ALL_DOCS: &str = "https://replicate.npmjs.com/_all_docs";
+const NPM_REGISTRY_METADATA_API: &str = "https://registry.npmjs.org/";
 const NPM_SEARCH_API: &str = "https://registry.npmjs.org/-/v1/search";
 const SCOPE_PAGE_SIZE: usize = 500;
 const SEARCH_PAGE_SIZE: usize = 250;
@@ -56,7 +59,7 @@ fn main() -> Result<()> {
     if selector_mode.is_some() {
         if !cli.no_deps {
             bail!(
-                "pnpm-rs-pre-scan: --no-deps is required for scope wildcard and maintainer scans"
+                "pnpm-rs-pre-scan: --no-deps is required for scope wildcard, maintainer, and all-versions scans"
             );
         }
         if cli.inspect_shell && packages.len() != 1 {
@@ -145,6 +148,15 @@ struct SearchPackage {
     name: String,
 }
 
+#[derive(Deserialize)]
+struct RegistryMetadataDocument {
+    versions: HashMap<String, RegistryVersionMarker>,
+    time: Option<HashMap<String, String>>,
+}
+
+#[derive(Deserialize)]
+struct RegistryVersionMarker {}
+
 #[derive(Debug, Deserialize, Default)]
 struct SecurityScanSummary {
     packages_scanned: usize,
@@ -200,6 +212,7 @@ enum WorkerScanResult {
 enum ScanSelectorKind {
     ScopeWildcard,
     Maintainer,
+    AllVersions,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -537,6 +550,7 @@ fn expand_scan_targets(spec: &str, debug: bool) -> Result<Vec<String>> {
     match scan_selector_kind(spec) {
         Some(ScanSelectorKind::ScopeWildcard) => list_scoped_packages(spec, debug),
         Some(ScanSelectorKind::Maintainer) => list_maintainer_packages(spec, debug),
+        Some(ScanSelectorKind::AllVersions) => list_package_versions(spec, debug),
         None => Ok(vec![spec.to_string()]),
     }
 }
@@ -547,6 +561,9 @@ fn scan_selector_kind(spec: &str) -> Option<ScanSelectorKind> {
     }
     if maintainer_selector(spec).is_some() {
         return Some(ScanSelectorKind::Maintainer);
+    }
+    if all_versions_selector(spec).is_some() {
+        return Some(ScanSelectorKind::AllVersions);
     }
     None
 }
@@ -669,6 +686,24 @@ fn list_maintainer_packages(spec: &str, debug: bool) -> Result<Vec<String>> {
     Ok(packages)
 }
 
+fn list_package_versions(spec: &str, debug: bool) -> Result<Vec<String>> {
+    let package = all_versions_selector(spec)
+        .ok_or_else(|| anyhow!("invalid all-versions selector: {spec}"))?;
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .context("build http client")?;
+    let metadata = fetch_registry_metadata_document(&client, &package, debug)?;
+    let versions = sorted_registry_versions(&metadata);
+    if versions.is_empty() {
+        bail!("no versions found for all-versions selector {spec}");
+    }
+    Ok(versions
+        .into_iter()
+        .map(|version| format!("{package}@{version}"))
+        .collect())
+}
+
 fn wildcard_scope_prefix(spec: &str) -> Option<String> {
     let trimmed = spec.trim();
     let raw_scope = trimmed.strip_suffix("/*")?;
@@ -711,6 +746,19 @@ fn maintainer_selector(spec: &str) -> Option<String> {
     normalize_maintainer_username(username)
 }
 
+fn all_versions_selector(spec: &str) -> Option<String> {
+    let trimmed = spec.trim();
+    let package = trimmed
+        .strip_prefix("all-versions:")
+        .or_else(|| trimmed.strip_prefix("versions:"))?
+        .trim();
+    if is_valid_package_name(package) {
+        Some(package.to_string())
+    } else {
+        None
+    }
+}
+
 fn normalize_maintainer_username(value: &str) -> Option<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() || trimmed.starts_with('@') {
@@ -739,8 +787,95 @@ fn is_valid_scope_name(scope: &str) -> bool {
         .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '-' | '_' | '.'))
 }
 
+fn is_valid_package_name(name: &str) -> bool {
+    if name.is_empty() || name.trim() != name || name.contains('\\') || name.contains("..") {
+        return false;
+    }
+    if name.chars().any(|ch| ch.is_control() || ch.is_whitespace()) {
+        return false;
+    }
+    if let Some(rest) = name.strip_prefix('@') {
+        let Some((scope, pkg)) = rest.split_once('/') else {
+            return false;
+        };
+        if scope.is_empty() || pkg.is_empty() || pkg.contains('/') {
+            return false;
+        }
+        return is_valid_name_segment(scope) && is_valid_name_segment(pkg);
+    }
+    !name.contains('/') && is_valid_name_segment(name)
+}
+
+fn is_valid_name_segment(segment: &str) -> bool {
+    if segment.is_empty() || segment.starts_with('.') || segment.starts_with('_') {
+        return false;
+    }
+    segment
+        .chars()
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '-' | '_' | '.'))
+}
+
 fn json_scalar(value: &str) -> String {
     serde_json::to_string(value).expect("json string literal")
+}
+
+fn fetch_registry_metadata_document(
+    client: &Client,
+    package: &str,
+    debug: bool,
+) -> Result<RegistryMetadataDocument> {
+    let encoded = urlencoding::encode(package);
+    let url = format!("{NPM_REGISTRY_METADATA_API}{encoded}");
+    if debug {
+        eprintln!("pnpm-rs-pre-scan debug: GET {url}");
+    }
+    let response = client
+        .get(&url)
+        .header("User-Agent", "pnpm-rs-pre-scan")
+        .send()
+        .with_context(|| format!("fetch package metadata {url}"))?;
+    if !response.status().is_success() {
+        bail!(
+            "package metadata lookup failed for {package}: {}",
+            response.status()
+        );
+    }
+    response
+        .json()
+        .with_context(|| format!("parse package metadata for {package}"))
+}
+
+fn sorted_registry_versions(metadata: &RegistryMetadataDocument) -> Vec<String> {
+    let mut versions: Vec<(String, Option<DateTime<Utc>>, Option<Version>)> = metadata
+        .versions
+        .keys()
+        .map(|version| {
+            let published = metadata
+                .time
+                .as_ref()
+                .and_then(|times| times.get(version))
+                .and_then(|ts| parse_registry_timestamp(ts));
+            let parsed = Version::parse(version).ok();
+            (version.clone(), published, parsed)
+        })
+        .collect();
+    versions.sort_by(|left, right| {
+        right
+            .1
+            .cmp(&left.1)
+            .then_with(|| right.2.cmp(&left.2))
+            .then_with(|| right.0.cmp(&left.0))
+    });
+    versions
+        .into_iter()
+        .map(|(version, _, _)| version)
+        .collect()
+}
+
+fn parse_registry_timestamp(raw: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .map(|ts| ts.with_timezone(&Utc))
 }
 
 fn read_scan_summary(path: &Path) -> Result<SecurityScanSummary> {
@@ -1288,11 +1423,13 @@ fn relative_path_between(from: &std::path::Path, to: &std::path::Path) -> Option
 #[cfg(test)]
 mod tests {
     use super::{
-        aggregate_scan_results, artifact_dir_name, build_add_args, copy_tree, maintainer_selector,
-        normalize_scan_summary_paths, relative_path_between, sanitize_artifact_component,
-        wildcard_scope_prefix, PackageLog, PackageScanOutcome, ScanFailure, SecurityScanSummary,
-        SecurityScanYaraMatch, SecurityScanYaraSummary,
+        aggregate_scan_results, all_versions_selector, artifact_dir_name, build_add_args,
+        copy_tree, maintainer_selector, normalize_scan_summary_paths, relative_path_between,
+        sanitize_artifact_component, sorted_registry_versions, wildcard_scope_prefix, PackageLog,
+        PackageScanOutcome, RegistryMetadataDocument, RegistryVersionMarker, ScanFailure,
+        SecurityScanSummary, SecurityScanYaraMatch, SecurityScanYaraSummary,
     };
+    use std::collections::HashMap;
     use std::fs;
     use std::path::{Path, PathBuf};
 
@@ -1381,6 +1518,25 @@ mod tests {
         assert!(maintainer_selector("@opengov/*").is_none());
         assert!(maintainer_selector("maintainer:OpenGov").is_none());
         assert!(maintainer_selector("https://example.com/~opengov-superadmin").is_none());
+    }
+
+    #[test]
+    fn all_versions_selector_accepts_named_prefixes() {
+        assert_eq!(
+            all_versions_selector("all-versions:react").as_deref(),
+            Some("react")
+        );
+        assert_eq!(
+            all_versions_selector("versions:@opengov/form-renderer").as_deref(),
+            Some("@opengov/form-renderer")
+        );
+    }
+
+    #[test]
+    fn all_versions_selector_rejects_invalid_package_specs() {
+        assert!(all_versions_selector("versions:react@19").is_none());
+        assert!(all_versions_selector("all-versions:OpenGov").is_none());
+        assert!(all_versions_selector("all-versions:@scope").is_none());
     }
 
     #[test]
@@ -1510,6 +1666,31 @@ mod tests {
 
         let yara = summary.yara.unwrap();
         assert_eq!(yara.match_locations[0].path, "node_modules/pkg/index.js");
+    }
+
+    #[test]
+    fn sorted_registry_versions_prefers_publish_time_then_semver() {
+        let metadata = RegistryMetadataDocument {
+            versions: HashMap::from([
+                ("1.0.0".to_string(), RegistryVersionMarker {}),
+                ("2.0.0".to_string(), RegistryVersionMarker {}),
+                ("1.5.0".to_string(), RegistryVersionMarker {}),
+            ]),
+            time: Some(HashMap::from([
+                ("1.0.0".to_string(), "2024-01-01T00:00:00.000Z".to_string()),
+                ("2.0.0".to_string(), "2023-01-01T00:00:00.000Z".to_string()),
+                ("1.5.0".to_string(), "2024-06-01T00:00:00.000Z".to_string()),
+            ])),
+        };
+
+        assert_eq!(
+            sorted_registry_versions(&metadata),
+            vec![
+                "1.5.0".to_string(),
+                "1.0.0".to_string(),
+                "2.0.0".to_string()
+            ]
+        );
     }
 
     #[test]

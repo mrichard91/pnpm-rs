@@ -54,11 +54,13 @@ make safety-check react@19 OLDER_THAN_YEARS=3
 make safety-check react@19 NO_DEPS=1
 make safety-check '@opengov/*' NO_DEPS=1 JOBS=4
 make safety-check 'maintainer:opengov-superadmin' NO_DEPS=1 JOBS=4
+make safety-check 'all-versions:react' NO_DEPS=1 JOBS=4
 make safety-check react@19 NO_DEPS=1 INSPECT=1
 make safety-check react@19 NO_DEPS=1 OUT_DIR=artifacts
 make safety-check react@19 YARA=rules.yar
 make safety-check '@opengov/*' YARA=rules.yar NO_DEPS=1 OUT_DIR=artifacts
 make safety-check 'https://www.npmjs.com/~opengov-superadmin' YARA=rules.yar NO_DEPS=1 JOBS=4
+make safety-check 'versions:@opengov/form-renderer' YARA=rules.yar NO_DEPS=1
 make safety-check PACKAGE='@opengov/*' YARA=rules.yar NO_DEPS=1
 ```
 
@@ -66,11 +68,12 @@ The `safety-check` target builds a Docker image containing `pnpm-rs` and `pnpm-r
 The binaries are built inside the Docker image, so the scan path does not depend on host-compiled artifacts.
 The container runs with the calling host UID/GID so exported `OUT_DIR` artifacts are written back with the same user permissions as the caller.
 Set `NO_DEPS=1` for a faster fetch-only analysis of just the named package; transitive dependencies are not downloaded in that mode.
-Set `JOBS=N` to run up to `N` package scans in parallel during wildcard namespace sweeps.
-For scope wildcard scans such as `@scope/*` and maintainer-target scans such as `maintainer:username` or `https://www.npmjs.com/~username`, `NO_DEPS=1` is required and you should quote the selector or pass it as `PACKAGE='...'`.
+Set `JOBS=N` to run up to `N` package scans in parallel during selector-driven sweeps.
+For scope wildcard scans such as `@scope/*`, maintainer-target scans such as `maintainer:username` or `https://www.npmjs.com/~username`, and all-version scans such as `all-versions:react` or `versions:@scope/pkg`, `NO_DEPS=1` is required and you should quote the selector or pass it as `PACKAGE='...'`.
 Set `INSPECT=1` to drop into `/bin/sh` inside the same temp project after the scan completes so you can inspect `package.json`, extracted files, and `node_modules` before the temp directory is cleaned up.
 Set `OUT_DIR=artifacts` to copy the full temporary analysis project to a host directory after the run completes. Saved projects are written under a timestamped subdirectory such as `artifacts/scan-react-19-<unix-seconds>/`.
-When a wildcard scan expands to multiple packages, `pnpm-rs-pre-scan` prints a final aggregate synopsis with total files scanned, YARA match counts, and the packages/files that matched.
+When a selector expands to multiple package targets, `pnpm-rs-pre-scan` prints a final aggregate synopsis with total files scanned, YARA match counts, and the packages/files that matched.
+Resolved-package output includes the version publish date, the package modified date, and the maintainer usernames from npm metadata for easier pivoting during incident review.
 Per-package output is structured with `[=]` for the package header, `  [+]` for normal progress, `  [-]` for suspicious findings or scan findings, and `  [*]` for command/runtime errors.
 
 ## Compatibility (intentional subset)
@@ -88,6 +91,7 @@ Supported commands and flags:
 - `pnpm-rs-pre-scan <pkg>` (helper binary; supports `--older-than-years`, `--yara`, `--no-deps`, `--jobs`, `--inspect-shell`, `--out-dir`)
 - `pnpm-rs-pre-scan '@scope/*' --no-deps` (expands public npm scope packages through the registry metadata mirror and scans each package separately)
 - `pnpm-rs-pre-scan 'maintainer:username' --no-deps` (expands packages from the npm maintainer search index and scans each package separately)
+- `pnpm-rs-pre-scan 'all-versions:react' --no-deps` (expands every published version of the package through npm registry metadata and scans each version separately)
 
 Intentionally left out:
 
@@ -129,6 +133,7 @@ There is also a helper that scans a single package in a temporary project:
 ./target/debug/pnpm-rs-pre-scan react@19 --older-than-years=3 --yara rules.yar
 ./target/debug/pnpm-rs-pre-scan '@opengov/*' --no-deps --jobs 4
 ./target/debug/pnpm-rs-pre-scan 'maintainer:opengov-superadmin' --no-deps --jobs 4
+./target/debug/pnpm-rs-pre-scan 'all-versions:react' --no-deps --jobs 4
 ./target/debug/pnpm-rs-pre-scan '@opengov/*' --no-deps --yara rules.yar --out-dir ./artifacts
 ```
 
@@ -138,7 +143,9 @@ There is also a helper that scans a single package in a temporary project:
 `--out-dir` copies the full temporary analysis project, including the installed `node_modules` tree and symlinks, into a timestamped directory under the requested path before cleanup.
 `@scope/*` scans enumerate exact package names from the public npm CouchDB metadata mirror, then run the normal temp-project scan flow once per package. That mode requires `--no-deps`, and `--inspect-shell` is only allowed when the wildcard expands to exactly one package.
 `maintainer:username`, `~username`, and `https://www.npmjs.com/~username` all expand through the npm maintainer search index, then run the same temp-project scan flow once per package. Because that source is search-index-backed, very recent publishes can lag behind the registry metadata.
-Multi-package wildcard scans end with an aggregate summary that includes total YARA file counts, total rule matches, and a concise list of matched packages and files.
+`all-versions:pkg` and `versions:pkg` expand every published version of a single package from npm registry metadata, sort the versions newest-first, and then run the same temp-project scan flow once per version.
+Selected-package output includes the resolved version, publish timestamp, package modified timestamp, and maintainer usernames from npm metadata.
+Multi-package selector scans end with an aggregate summary that includes total YARA file counts, total rule matches, and a concise list of matched packages and files.
 
 Bulk scan examples:
 
@@ -146,20 +153,22 @@ Bulk scan examples:
 make safety-check '@opengov/*' NO_DEPS=1
 make safety-check '@opengov/*' NO_DEPS=1 JOBS=4
 make safety-check 'maintainer:opengov-superadmin' NO_DEPS=1 JOBS=4
+make safety-check 'all-versions:react' NO_DEPS=1 JOBS=4
 make safety-check '@opengov/*' YARA=test.yara NO_DEPS=1
 make safety-check '@opengov/*' YARA=test.yara NO_DEPS=1 OUT_DIR=artifacts
 ./target/debug/pnpm-rs-pre-scan '@opengov/*' --no-deps --jobs 4
 ./target/debug/pnpm-rs-pre-scan 'maintainer:opengov-superadmin' --no-deps --jobs 4
+./target/debug/pnpm-rs-pre-scan 'versions:@opengov/form-renderer' --no-deps --jobs 4
 ./target/debug/pnpm-rs-pre-scan '@opengov/*' --no-deps --yara test.yara
 ```
 
 Recommended pattern for large namespace sweeps:
 
 1. Start with `NO_DEPS=1` so each package is inspected in isolation.
-2. Add `JOBS=4` or similar to parallelize large namespace sweeps without opening unlimited concurrent requests.
+2. Add `JOBS=4` or similar to parallelize large namespace, maintainer, or all-version sweeps without opening unlimited concurrent requests.
 3. Add `YARA=...` only when you want file-content scanning.
 4. Add `OUT_DIR=artifacts` when you want to preserve suspicious packages for offline inspection.
-5. Quote selectors like `@scope/*` or `maintainer:username`, or pass them as `PACKAGE='...'`, to avoid accidental shell glob expansion and shell parsing surprises.
+5. Quote selectors like `@scope/*`, `maintainer:username`, or `all-versions:pkg`, or pass them as `PACKAGE='...'`, to avoid accidental shell glob expansion and shell parsing surprises.
 
 ## Tests
 

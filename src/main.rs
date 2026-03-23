@@ -2325,9 +2325,49 @@ fn selected_metadata_summary_line(name: &str, version: &str, meta: &RegistryPack
         .flatten()
         .map(|ts| ts.to_rfc3339())
         .unwrap_or_else(|| "unknown".to_string());
+    let maintainers = package_maintainer_names(meta);
+    let maintainer_summary = if maintainers.is_empty() {
+        "unknown".to_string()
+    } else {
+        maintainers.join(", ")
+    };
     format!(
-        "Selected package: {name}@{version} (version published {version_published}; package modified {modified})"
+        "Selected package: {name}@{version} (version published {version_published}; package modified {modified}; maintainers {maintainer_summary})"
     )
+}
+
+fn package_maintainer_names(meta: &RegistryPackage) -> Vec<String> {
+    let Some(maintainers) = &meta.maintainers else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    let mut seen = HashSet::new();
+    for maintainer in maintainers {
+        let Some(identifier) = maintainer_identifier(maintainer) else {
+            continue;
+        };
+        if seen.insert(identifier.clone()) {
+            names.push(identifier);
+        }
+    }
+    names
+}
+
+fn maintainer_identifier(maintainer: &RegistryMaintainer) -> Option<String> {
+    maintainer
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            maintainer
+                .email
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+        })
 }
 
 fn compile_yara_rules(path: &str) -> Result<yara::Rules> {
@@ -2535,6 +2575,7 @@ struct RegistryPackage {
     #[serde(rename = "dist-tags")]
     dist_tags: HashMap<String, String>,
     time: Option<HashMap<String, String>>,
+    maintainers: Option<Vec<RegistryMaintainer>>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -2550,6 +2591,12 @@ struct RegistryVersion {
     #[serde(rename = "hasBin")]
     has_bin: Option<bool>,
     dist: RegistryDist,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct RegistryMaintainer {
+    name: Option<String>,
+    email: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -5083,6 +5130,7 @@ mod tests {
                 )]),
                 dist_tags: HashMap::from([("latest".to_string(), "19.2.0".to_string())]),
                 time: None,
+                maintainers: None,
             },
         )]);
 
@@ -5106,6 +5154,16 @@ mod tests {
                     "2026-03-22T13:14:15.000Z".to_string(),
                 ),
             ])),
+            maintainers: Some(vec![
+                RegistryMaintainer {
+                    name: Some("opengov-superadmin".to_string()),
+                    email: Some("ops@example.com".to_string()),
+                },
+                RegistryMaintainer {
+                    name: Some("another-maintainer".to_string()),
+                    email: None,
+                },
+            ]),
         };
 
         let line = selected_metadata_summary_line("react", "19.2.0", &meta);
@@ -5113,6 +5171,7 @@ mod tests {
         assert!(line.contains("Selected package: react@19.2.0"));
         assert!(line.contains("version published 2026-03-20T10:11:12+00:00"));
         assert!(line.contains("package modified 2026-03-22T13:14:15+00:00"));
+        assert!(line.contains("maintainers opengov-superadmin, another-maintainer"));
     }
 
     #[test]

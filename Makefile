@@ -20,10 +20,12 @@ safety-check-help:
 	@echo "example: make safety-check react@19 NO_DEPS=1"
 	@echo "example: make safety-check '@opengov/*' NO_DEPS=1 JOBS=4"
 	@echo "example: make safety-check 'maintainer:opengov-superadmin' NO_DEPS=1 JOBS=4"
+	@echo "example: make safety-check 'all-versions:react' NO_DEPS=1 JOBS=4"
 	@echo "example: make safety-check react@19 NO_DEPS=1 INSPECT=1"
 	@echo "example: make safety-check react@19 NO_DEPS=1 OUT_DIR=artifacts"
 	@echo "example: make safety-check '@opengov/*' YARA=test.yara NO_DEPS=1 OUT_DIR=artifacts"
 	@echo "example: make safety-check 'https://www.npmjs.com/~opengov-superadmin' YARA=test.yara NO_DEPS=1 JOBS=4"
+	@echo "example: make safety-check 'versions:@opengov/form-renderer' YARA=test.yara NO_DEPS=1"
 	@echo "example: make safety-check PACKAGE='@opengov/*' YARA=test.yara NO_DEPS=1"
 
 safety-check-image:
