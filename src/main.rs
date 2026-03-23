@@ -3184,6 +3184,10 @@ fn install_with_resolution(
 
     let custom_host = custom_registry_host(registry);
     let custom_host_ref = custom_host.as_deref();
+    let download_client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .context("build http client")?;
 
     let mut node_keys: Vec<_> = resolve.nodes.keys().cloned().collect();
     node_keys.sort();
@@ -3196,6 +3200,7 @@ fn install_with_resolution(
             resolve,
             debug,
             custom_host_ref,
+            &download_client,
         )?;
     }
 
@@ -3229,6 +3234,7 @@ fn install_package(
     resolve: &ResolveResult,
     debug: bool,
     custom_host: Option<&str>,
+    client: &reqwest::blocking::Client,
 ) -> Result<()> {
     let meta = resolve
         .metadata
@@ -3245,7 +3251,7 @@ fn install_package(
     if debug {
         eprintln!("pnpm-rs debug: download {tarball_url}");
     }
-    let tarball = download_tarball(tarball_url)?;
+    let tarball = download_tarball_with_client(client, tarball_url)?;
     verify_download_integrity(
         &tarball,
         version_entry.dist.integrity.as_deref(),
@@ -3479,11 +3485,7 @@ fn is_allowed_tarball_host(host: &str, custom_registry_host: Option<&str>) -> bo
     false
 }
 
-fn download_tarball(url: &str) -> Result<Vec<u8>> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()
-        .context("build http client")?;
+fn download_tarball_with_client(client: &reqwest::blocking::Client, url: &str) -> Result<Vec<u8>> {
     let mut response = client
         .get(url)
         .header("User-Agent", "pnpm-rs")
@@ -4206,7 +4208,7 @@ fn lockfile_satisfies_manifest(
 fn install_from_lockfile(
     cwd: &Path,
     lockfile: &LockfileIn,
-    _debug: bool,
+    debug: bool,
     registry: &str,
 ) -> Result<()> {
     println!("Progress: installing from lockfile");
@@ -4220,6 +4222,11 @@ fn install_from_lockfile(
 
     let custom_host = custom_registry_host(registry);
     let custom_host_ref = custom_host.as_deref();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .context("build http client")?;
+    let mut metadata_cache: HashMap<String, RegistryPackage> = HashMap::new();
 
     let packages = lockfile.packages.as_ref().cloned().unwrap_or_default();
     let snapshots = lockfile.snapshots.as_ref().cloned().unwrap_or_default();
@@ -4238,22 +4245,7 @@ fn install_from_lockfile(
         }
 
         // We need to download this package
-        let encoded = urlencoding::encode(&name);
-        let url = format!("{registry}{encoded}");
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(60))
-            .build()
-            .context("build http client")?;
-        println!("Fetching metadata: {name}");
-        let response = client
-            .get(&url)
-            .header("User-Agent", "pnpm-rs")
-            .send()
-            .with_context(|| format!("fetch registry metadata {url}"))?;
-        if !response.status().is_success() {
-            bail!("registry lookup failed for {name}: {}", response.status());
-        }
-        let meta: RegistryPackage = response.json().context("parse registry json")?;
+        let meta = fetch_registry_metadata(&client, &name, &mut metadata_cache, debug, registry)?;
         let version_entry = meta
             .versions
             .get(&version)
@@ -4262,7 +4254,7 @@ fn install_from_lockfile(
         let tarball_url = &version_entry.dist.tarball;
         ensure_trusted_tarball_url(tarball_url, custom_host_ref)?;
         println!("Downloading {name}@{version}");
-        let tarball = download_tarball(tarball_url)?;
+        let tarball = download_tarball_with_client(&client, tarball_url)?;
 
         // Use lockfile integrity if available, fall back to registry
         let lockfile_integrity = pkg_snapshot

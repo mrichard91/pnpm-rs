@@ -1,8 +1,10 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -13,9 +15,11 @@ use serde::Deserialize;
 use tempfile::TempDir;
 
 const NPM_REPLICATE_ALL_DOCS: &str = "https://replicate.npmjs.com/_all_docs";
+const NPM_SEARCH_API: &str = "https://registry.npmjs.org/-/v1/search";
 const SCOPE_PAGE_SIZE: usize = 500;
+const SEARCH_PAGE_SIZE: usize = 250;
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(
     name = "pnpm-rs-pre-scan",
     about = "Scan a package before installing by using pnpm-rs in a temp project"
@@ -32,20 +36,28 @@ struct Cli {
     inspect_shell: bool,
     #[arg(long)]
     out_dir: Option<PathBuf>,
+    #[arg(long, default_value_t = 1)]
+    jobs: usize,
     #[arg(long, default_value_t = false)]
     debug: bool,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if cli.jobs == 0 {
+        bail!("pnpm-rs-pre-scan: --jobs must be at least 1");
+    }
     let pnpm_rs = find_pnpm_rs()?;
     let packages = expand_scan_targets(&cli.package, cli.debug)?;
-    let wildcard_mode = wildcard_scope_prefix(&cli.package).is_some();
+    let selector_mode = scan_selector_kind(&cli.package);
     let many_packages = packages.len() > 1;
+    let jobs = cli.jobs.min(packages.len().max(1));
 
-    if wildcard_mode {
+    if selector_mode.is_some() {
         if !cli.no_deps {
-            bail!("pnpm-rs-pre-scan: --no-deps is required for scope wildcard scans");
+            bail!(
+                "pnpm-rs-pre-scan: --no-deps is required for scope wildcard and maintainer scans"
+            );
         }
         if cli.inspect_shell && packages.len() != 1 {
             bail!(
@@ -53,32 +65,21 @@ fn main() -> Result<()> {
                 packages.len()
             );
         }
-        eprintln!(
-            "pnpm-rs-pre-scan: expanded {} to {} package(s)",
+        println!(
+            "[=] expanded {} to {} package(s)",
             cli.package,
             packages.len()
         );
+        if jobs > 1 {
+            println!("  [+] using {jobs} parallel worker(s)");
+        }
     }
 
-    let mut results = Vec::new();
-    let mut failures = Vec::new();
-    for (idx, package) in packages.iter().enumerate() {
-        if many_packages {
-            eprintln!(
-                "pnpm-rs-pre-scan: [{}/{}] scanning {}",
-                idx + 1,
-                packages.len(),
-                package
-            );
-        }
-        match scan_one_package(&pnpm_rs, package, &cli) {
-            Ok(result) => results.push(result),
-            Err(err) => {
-                eprintln!("pnpm-rs-pre-scan: scan failed for {package}: {err:#}");
-                failures.push(package.clone());
-            }
-        }
-    }
+    let (results, failures) = if many_packages && jobs > 1 {
+        run_parallel_scans(&pnpm_rs, &packages, &cli, jobs)
+    } else {
+        run_serial_scans(&pnpm_rs, &packages, &cli)
+    };
 
     if many_packages {
         print_multi_scan_summary(&cli.package, &results, &failures, cli.yara.is_some());
@@ -86,19 +87,15 @@ fn main() -> Result<()> {
 
     if failures.is_empty() {
         if many_packages {
-            eprintln!(
-                "pnpm-rs-pre-scan: completed {} package scan(s) successfully",
+            println!(
+                "[=] completed {} package scan(s) successfully",
                 packages.len()
             );
         }
         return Ok(());
     }
 
-    bail!(
-        "pnpm-rs-pre-scan: {} package scan(s) failed: {}",
-        failures.len(),
-        failures.join(", ")
-    )
+    bail!("{}", format_failure_error(&failures))
 }
 
 fn build_add_args(package: &str, no_deps: bool) -> Vec<String> {
@@ -132,6 +129,22 @@ struct AllDocsRow {
     key: String,
 }
 
+#[derive(Deserialize)]
+struct SearchResponse {
+    objects: Vec<SearchObject>,
+    total: usize,
+}
+
+#[derive(Deserialize)]
+struct SearchObject {
+    package: SearchPackage,
+}
+
+#[derive(Deserialize)]
+struct SearchPackage {
+    name: String,
+}
+
 #[derive(Debug, Deserialize, Default)]
 struct SecurityScanSummary {
     packages_scanned: usize,
@@ -161,6 +174,32 @@ struct SecurityScanYaraMatch {
 struct PackageScanOutcome {
     package: String,
     summary: SecurityScanSummary,
+    log: PackageLog,
+}
+
+#[derive(Debug)]
+struct ScanFailure {
+    package: String,
+    error: String,
+    log: PackageLog,
+}
+
+#[derive(Debug)]
+enum WorkerScanResult {
+    Success {
+        index: usize,
+        outcome: PackageScanOutcome,
+    },
+    Failure {
+        index: usize,
+        failure: ScanFailure,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScanSelectorKind {
+    ScopeWildcard,
+    Maintainer,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -187,12 +226,82 @@ struct AggregateScanSummary {
     matched_files: Vec<AggregatedMatchLocation>,
 }
 
-fn scan_one_package(bin: &PathBuf, package: &str, cli: &Cli) -> Result<PackageScanOutcome> {
-    let temp = TempDir::new().context("create temp dir")?;
+#[derive(Debug, Default)]
+struct PackageLog {
+    lines: Vec<String>,
+}
 
-    run_cmd(bin, &["init"], temp.path(), cli.debug)?;
+impl PackageLog {
+    fn scanning(package: &str) -> Self {
+        let mut log = Self::default();
+        log.header(&format!("scanning {package}"));
+        log
+    }
+
+    fn header(&mut self, message: &str) {
+        self.lines.push(format!("[=] {message}"));
+    }
+
+    fn info(&mut self, message: &str) {
+        self.lines.push(format!("  [+] {message}"));
+    }
+
+    fn bad(&mut self, message: &str) {
+        self.lines.push(format!("  [-] {message}"));
+    }
+
+    fn error(&mut self, message: &str) {
+        self.lines.push(format!("  [*] {message}"));
+    }
+
+    fn has_output(&self) -> bool {
+        !self.lines.is_empty()
+    }
+}
+
+#[derive(Debug)]
+struct CommandRunOutput {
+    status: std::process::ExitStatus,
+    stdout: String,
+    stderr: String,
+}
+
+fn scan_one_package(
+    bin: &PathBuf,
+    package: &str,
+    cli: &Cli,
+) -> std::result::Result<PackageScanOutcome, ScanFailure> {
+    let mut log = PackageLog::scanning(package);
+    let temp = match TempDir::new().context("create temp dir") {
+        Ok(temp) => temp,
+        Err(err) => return Err(scan_failure_from_log(package, log, err)),
+    };
+    log.info(&format!(
+        "created temp project at {}",
+        temp.path().display()
+    ));
+
+    if let Err(err) = run_cmd(
+        bin,
+        &["init"],
+        temp.path(),
+        cli.debug,
+        "initialize temp project",
+        &mut log,
+    ) {
+        return Err(scan_failure_from_log(package, log, err));
+    }
     let add_args = build_add_args(package, cli.no_deps);
-    run_cmd_dynamic(bin, &add_args, temp.path(), cli.debug)?;
+    if let Err(err) = run_cmd_dynamic(
+        bin,
+        &add_args,
+        temp.path(),
+        cli.debug,
+        "install target package",
+        &mut log,
+    ) {
+        return Err(scan_failure_from_log(package, log, err));
+    }
 
     let mut scan_args = vec!["security-scan".to_string()];
     scan_args.push(format!("--older-than-years={}", cli.older_than_years));
@@ -203,39 +312,182 @@ fn scan_one_package(bin: &PathBuf, package: &str, cli: &Cli) -> Result<PackageSc
     let summary_path = temp.path().join(".pnpm-rs-security-scan-summary.json");
     scan_args.push("--summary-json".to_string());
     scan_args.push(summary_path.display().to_string());
-    run_cmd_dynamic(bin, &scan_args, temp.path(), cli.debug)?;
-    let mut summary = read_scan_summary(&summary_path)?;
+    if let Err(err) = run_cmd_dynamic(
+        bin,
+        &scan_args,
+        temp.path(),
+        cli.debug,
+        "run security scan",
+        &mut log,
+    ) {
+        return Err(scan_failure_from_log(package, log, err));
+    }
+    let mut summary = match read_scan_summary(&summary_path) {
+        Ok(summary) => summary,
+        Err(err) => return Err(scan_failure_from_log(package, log, err)),
+    };
     normalize_scan_summary_paths(&mut summary, temp.path());
+    log.info(&format!(
+        "scan summary: packages={}, issues={}",
+        summary.packages_scanned, summary.issues_found
+    ));
 
     if cli.inspect_shell {
         if let Some(out_dir) = &cli.out_dir {
-            eprintln!(
-                "pnpm-rs-pre-scan: artifacts will be copied to {} after you exit the inspection shell",
+            log.info(&format!(
+                "artifacts will be copied to {} after you exit the inspection shell",
                 out_dir.display()
-            );
+            ));
         }
-        launch_inspection_shell(temp.path())?;
+        if let Err(err) = launch_inspection_shell(temp.path()) {
+            return Err(scan_failure_from_log(package, log, err));
+        }
+        log.info("inspection shell exited");
     }
 
     if let Some(out_dir) = &cli.out_dir {
-        let saved_path = export_artifacts(temp.path(), out_dir, package)?;
-        eprintln!(
-            "pnpm-rs-pre-scan: saved analysis project to {}",
+        let saved_path = match export_artifacts(temp.path(), out_dir, package) {
+            Ok(saved_path) => saved_path,
+            Err(err) => return Err(scan_failure_from_log(package, log, err)),
+        };
+        log.info(&format!(
+            "saved analysis project to {}",
             saved_path.display()
-        );
+        ));
     }
 
     Ok(PackageScanOutcome {
         package: package.to_string(),
         summary,
+        log,
     })
 }
 
-fn expand_scan_targets(spec: &str, debug: bool) -> Result<Vec<String>> {
-    if wildcard_scope_prefix(spec).is_some() {
-        return list_scoped_packages(spec, debug);
+fn run_serial_scans(
+    pnpm_rs: &PathBuf,
+    packages: &[String],
+    cli: &Cli,
+) -> (Vec<PackageScanOutcome>, Vec<ScanFailure>) {
+    let mut results = Vec::new();
+    let mut failures = Vec::new();
+    for package in packages {
+        match scan_one_package(pnpm_rs, package, cli) {
+            Ok(result) => {
+                print_package_log(&result.log);
+                results.push(result);
+            }
+            Err(err) => {
+                print_package_log(&err.log);
+                failures.push(err);
+            }
+        }
     }
-    Ok(vec![spec.to_string()])
+    (results, failures)
+}
+
+fn run_parallel_scans(
+    pnpm_rs: &PathBuf,
+    packages: &[String],
+    cli: &Cli,
+    jobs: usize,
+) -> (Vec<PackageScanOutcome>, Vec<ScanFailure>) {
+    let queue = Arc::new(Mutex::new(
+        packages
+            .iter()
+            .cloned()
+            .enumerate()
+            .collect::<VecDeque<(usize, String)>>(),
+    ));
+    let (tx, rx) = mpsc::channel::<WorkerScanResult>();
+    let total = packages.len();
+
+    for _ in 0..jobs {
+        let queue = Arc::clone(&queue);
+        let tx = tx.clone();
+        let pnpm_rs = pnpm_rs.clone();
+        let cli = cli.clone();
+        thread::spawn(move || {
+            worker_loop(queue, tx, pnpm_rs, cli);
+        });
+    }
+    drop(tx);
+
+    let mut result_slots: Vec<Option<PackageScanOutcome>> =
+        std::iter::repeat_with(|| None).take(total).collect();
+    let mut failure_slots: Vec<Option<ScanFailure>> =
+        std::iter::repeat_with(|| None).take(total).collect();
+
+    for message in rx {
+        match message {
+            WorkerScanResult::Success { index, outcome } => {
+                let mut outcome = outcome;
+                outcome
+                    .log
+                    .info(&format!("completed package scan {}/{}", index + 1, total));
+                print_package_log(&outcome.log);
+                result_slots[index] = Some(outcome);
+            }
+            WorkerScanResult::Failure { index, failure } => {
+                let mut failure = failure;
+                failure.log.error(&format!(
+                    "package scan failed at position {}/{}",
+                    index + 1,
+                    total
+                ));
+                print_package_log(&failure.log);
+                failure_slots[index] = Some(failure);
+            }
+        }
+    }
+
+    let results = result_slots.into_iter().flatten().collect();
+    let failures = failure_slots.into_iter().flatten().collect();
+    (results, failures)
+}
+
+fn worker_loop(
+    queue: Arc<Mutex<VecDeque<(usize, String)>>>,
+    tx: mpsc::Sender<WorkerScanResult>,
+    pnpm_rs: PathBuf,
+    cli: Cli,
+) {
+    loop {
+        let next = match queue.lock() {
+            Ok(mut guard) => guard.pop_front(),
+            Err(_) => return,
+        };
+        let Some((index, package)) = next else {
+            return;
+        };
+        let message = match scan_one_package(&pnpm_rs, &package, &cli) {
+            Ok(outcome) => WorkerScanResult::Success { index, outcome },
+            Err(err) => WorkerScanResult::Failure {
+                index,
+                failure: err,
+            },
+        };
+        if tx.send(message).is_err() {
+            return;
+        }
+    }
+}
+
+fn expand_scan_targets(spec: &str, debug: bool) -> Result<Vec<String>> {
+    match scan_selector_kind(spec) {
+        Some(ScanSelectorKind::ScopeWildcard) => list_scoped_packages(spec, debug),
+        Some(ScanSelectorKind::Maintainer) => list_maintainer_packages(spec, debug),
+        None => Ok(vec![spec.to_string()]),
+    }
+}
+
+fn scan_selector_kind(spec: &str) -> Option<ScanSelectorKind> {
+    if wildcard_scope_prefix(spec).is_some() {
+        return Some(ScanSelectorKind::ScopeWildcard);
+    }
+    if maintainer_selector(spec).is_some() {
+        return Some(ScanSelectorKind::Maintainer);
+    }
+    None
 }
 
 fn list_scoped_packages(spec: &str, debug: bool) -> Result<Vec<String>> {
@@ -302,6 +554,60 @@ fn list_scoped_packages(spec: &str, debug: bool) -> Result<Vec<String>> {
     Ok(packages)
 }
 
+fn list_maintainer_packages(spec: &str, debug: bool) -> Result<Vec<String>> {
+    let maintainer =
+        maintainer_selector(spec).ok_or_else(|| anyhow!("invalid maintainer selector: {spec}"))?;
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .context("build http client")?;
+
+    let mut from = 0usize;
+    let mut packages = Vec::new();
+    loop {
+        let mut url = Url::parse(NPM_SEARCH_API).context("parse search endpoint")?;
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("text", &format!("maintainer:{maintainer}"));
+            query.append_pair("size", &SEARCH_PAGE_SIZE.to_string());
+            query.append_pair("from", &from.to_string());
+        }
+        if debug {
+            eprintln!("pnpm-rs-pre-scan debug: GET {url}");
+        }
+        let response = client
+            .get(url)
+            .header("User-Agent", "pnpm-rs-pre-scan")
+            .send()
+            .context("fetch maintainer package list")?;
+        if !response.status().is_success() {
+            bail!(
+                "maintainer package list query failed: {}",
+                response.status()
+            );
+        }
+        let payload: SearchResponse = response.json().context("parse maintainer package list")?;
+        if payload.objects.is_empty() {
+            break;
+        }
+        let batch_len = payload.objects.len();
+        for object in payload.objects {
+            packages.push(object.package.name);
+        }
+        from += batch_len;
+        if from >= payload.total || batch_len < SEARCH_PAGE_SIZE {
+            break;
+        }
+    }
+
+    packages.sort();
+    packages.dedup();
+    if packages.is_empty() {
+        bail!("no packages found for maintainer selector {spec}");
+    }
+    Ok(packages)
+}
+
 fn wildcard_scope_prefix(spec: &str) -> Option<String> {
     let trimmed = spec.trim();
     let raw_scope = trimmed.strip_suffix("/*")?;
@@ -318,6 +624,47 @@ fn wildcard_scope_prefix(spec: &str) -> Option<String> {
         return None;
     }
     Some(format!("{normalized}/"))
+}
+
+fn maintainer_selector(spec: &str) -> Option<String> {
+    let trimmed = spec.trim();
+    if let Some(username) = trimmed.strip_prefix("maintainer:") {
+        return normalize_maintainer_username(username);
+    }
+    if let Some(username) = trimmed.strip_prefix('~') {
+        return normalize_maintainer_username(username);
+    }
+    let parsed = Url::parse(trimmed).ok()?;
+    let host = parsed.host_str()?;
+    if host != "www.npmjs.com" && host != "npmjs.com" {
+        return None;
+    }
+    let username = parsed
+        .path()
+        .trim()
+        .trim_end_matches('/')
+        .strip_prefix("/~")?;
+    if username.contains('/') {
+        return None;
+    }
+    normalize_maintainer_username(username)
+}
+
+fn normalize_maintainer_username(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.starts_with('@') {
+        return None;
+    }
+    if trimmed.starts_with('.') || trimmed.starts_with('_') {
+        return None;
+    }
+    if !trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '-' | '_' | '.'))
+    {
+        return None;
+    }
+    Some(trimmed.to_string())
 }
 
 fn is_valid_scope_name(scope: &str) -> bool {
@@ -353,7 +700,7 @@ fn normalize_scan_summary_paths(summary: &mut SecurityScanSummary, root: &Path) 
 
 fn aggregate_scan_results(
     results: &[PackageScanOutcome],
-    failures: &[String],
+    failures: &[ScanFailure],
 ) -> AggregateScanSummary {
     let mut summary = AggregateScanSummary {
         successful_scans: results.len(),
@@ -401,71 +748,213 @@ fn aggregate_scan_results(
 fn print_multi_scan_summary(
     requested: &str,
     results: &[PackageScanOutcome],
-    failures: &[String],
+    failures: &[ScanFailure],
     yara_enabled: bool,
 ) {
     let summary = aggregate_scan_results(results, failures);
     println!();
-    println!("pnpm-rs-pre-scan summary:");
-    println!("- requested target: {requested}");
-    println!("- package scans completed: {}", summary.successful_scans);
-    println!("- package scans failed: {}", summary.failed_scans);
-    println!("- packages scanned: {}", summary.packages_scanned);
+    println!("[=] summary");
+    println!("  [+] requested target: {requested}");
     println!(
-        "- workspace importers scanned: {}",
+        "  [+] package scans completed: {}",
+        summary.successful_scans
+    );
+    println!("  [+] package scans failed: {}", summary.failed_scans);
+    println!("  [+] packages scanned: {}", summary.packages_scanned);
+    println!(
+        "  [+] workspace importers scanned: {}",
         summary.workspace_importers_scanned
     );
-    println!("- packages with issues: {}", summary.packages_with_issues);
-    println!("- issues found: {}", summary.issues_found);
+    println!(
+        "  [+] packages with issues: {}",
+        summary.packages_with_issues
+    );
+    println!("  [+] issues found: {}", summary.issues_found);
+    if !failures.is_empty() {
+        println!("  [*] failed packages:");
+        for failure in failures {
+            println!("    [*] {}: {}", failure.package, failure.error);
+        }
+    }
     if !yara_enabled {
-        println!("- YARA enabled: no");
+        println!("  [+] YARA enabled: no");
         return;
     }
-    println!("- YARA files scanned: {}", summary.files_scanned);
-    println!("- YARA rule matches: {}", summary.rule_matches);
-    println!("- YARA string matches: {}", summary.string_matches);
+    println!("  [+] YARA files scanned: {}", summary.files_scanned);
+    println!("  [+] YARA rule matches: {}", summary.rule_matches);
+    println!("  [+] YARA string matches: {}", summary.string_matches);
     println!(
-        "- target packages with YARA matches: {}",
+        "  [+] target packages with YARA matches: {}",
         summary.packages_with_matches.len()
     );
-    println!("- matched files: {}", summary.matched_files.len());
+    println!("  [+] matched files: {}", summary.matched_files.len());
     if !summary.rules_matched.is_empty() {
-        println!("- matched rules: {}", summary.rules_matched.join(", "));
+        println!("  [+] matched rules: {}", summary.rules_matched.join(", "));
     }
     if !summary.packages_with_matches.is_empty() {
-        println!("Target packages with YARA matches:");
+        println!("  [-] target packages with YARA matches:");
         for package in &summary.packages_with_matches {
-            println!("- {package}");
+            println!("    [-] {package}");
         }
     }
     if !summary.matched_files.is_empty() {
-        println!("Matched files:");
+        println!("  [-] matched files:");
         for entry in &summary.matched_files {
             println!(
-                "- {} [{}] {} (rule {})",
+                "    [-] {} [{}] {} (rule {})",
                 entry.scanned_package, entry.source_package, entry.path, entry.rule
             );
         }
     }
 }
 
-fn run_cmd(bin: &PathBuf, args: &[&str], cwd: &std::path::Path, debug: bool) -> Result<()> {
+fn scan_failure_from_log(package: &str, mut log: PackageLog, err: anyhow::Error) -> ScanFailure {
+    let rendered = format!("{err:#}");
+    let error = rendered
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("scan failed")
+        .to_string();
+    for line in rendered.lines().filter(|line| !line.trim().is_empty()) {
+        log.error(line.trim());
+    }
+    ScanFailure {
+        package: package.to_string(),
+        error,
+        log,
+    }
+}
+
+fn format_failure_error(failures: &[ScanFailure]) -> String {
+    let mut message = format!(
+        "pnpm-rs-pre-scan: {} package scan(s) failed",
+        failures.len()
+    );
+    for failure in failures {
+        message.push_str(&format!("\n- {}: {}", failure.package, failure.error));
+    }
+    message
+}
+
+fn print_package_log(log: &PackageLog) {
+    if !log.has_output() {
+        return;
+    }
+    for line in &log.lines {
+        println!("{line}");
+    }
+}
+
+fn emit_command_output(log: &mut PackageLog, step_label: &str, output: &CommandRunOutput) {
+    for line in output
+        .stdout
+        .lines()
+        .chain(output.stderr.lines())
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        classify_command_line(log, step_label, line);
+    }
+}
+
+fn classify_command_line(log: &mut PackageLog, step_label: &str, line: &str) {
+    if step_label == "run security scan" {
+        if matches!(
+            line,
+            "Security scan report:" | "YARA summary:" | "No issues detected."
+        ) || line.starts_with("- packages scanned:")
+            || line.starts_with("- workspace importers scanned:")
+            || line.starts_with("- packages with issues:")
+            || line.starts_with("- issues found:")
+            || line.starts_with("- files scanned:")
+            || line.starts_with("- rule matches:")
+            || line.starts_with("- string matches:")
+            || line.starts_with("- rules matched:")
+            || line.starts_with("- packages with matches:")
+            || line.starts_with("- rule list:")
+            || line.starts_with("- target packages with YARA matches:")
+            || line.starts_with("- matched files:")
+        {
+            log.info(line);
+            return;
+        }
+        if line.starts_with("warning:") || line.starts_with("warn:") {
+            log.error(line);
+            return;
+        }
+        log.bad(line);
+        return;
+    }
+
+    if line.starts_with("warning:") || line.starts_with("warn:") {
+        log.error(line);
+    } else if line.to_ascii_lowercase().contains("blocked")
+        || line.to_ascii_lowercase().contains("lifecycle script")
+    {
+        log.bad(line);
+    } else {
+        log.info(line);
+    }
+}
+
+fn command_failure_message(step_label: &str, output: &CommandRunOutput) -> String {
+    let suffix = output
+        .stderr
+        .lines()
+        .chain(output.stdout.lines())
+        .map(str::trim)
+        .rev()
+        .find(|line| !line.is_empty())
+        .map(|line| format!(": {line}"))
+        .unwrap_or_default();
+    match output.status.code() {
+        Some(code) => format!("{step_label} failed with exit code {code}{suffix}"),
+        None => format!("{step_label} terminated by signal{suffix}"),
+    }
+}
+
+fn run_cmd(
+    bin: &PathBuf,
+    args: &[&str],
+    cwd: &std::path::Path,
+    debug: bool,
+    step_label: &str,
+    log: &mut PackageLog,
+) -> Result<()> {
+    log.info(step_label);
+    let output = run_cmd_capture(bin, args, cwd, debug)?;
+    emit_command_output(log, step_label, &output);
+    if !output.status.success() {
+        let reason = command_failure_message(step_label, &output);
+        log.error(&reason);
+        return Err(anyhow!(reason));
+    }
+    Ok(())
+}
+
+fn run_cmd_capture(
+    bin: &PathBuf,
+    args: &[&str],
+    cwd: &std::path::Path,
+    debug: bool,
+) -> Result<CommandRunOutput> {
     let mut cmd = Command::new(bin);
     cmd.args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     if debug {
         cmd.arg("--debug");
     }
-    let status = cmd
-        .status()
+    let output = cmd
+        .output()
         .with_context(|| format!("run {}", bin.display()))?;
-    if !status.success() {
-        return Err(anyhow!("command failed: {} {:?}", bin.display(), args));
-    }
-    Ok(())
+    Ok(CommandRunOutput {
+        status: output.status,
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    })
 }
 
 fn run_cmd_dynamic(
@@ -473,28 +962,39 @@ fn run_cmd_dynamic(
     args: &[String],
     cwd: &std::path::Path,
     debug: bool,
+    step_label: &str,
+    log: &mut PackageLog,
 ) -> Result<()> {
+    log.info(step_label);
     let mut cmd = Command::new(bin);
     cmd.args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     if debug {
         cmd.arg("--debug");
     }
-    let status = cmd
-        .status()
+    let output = cmd
+        .output()
         .with_context(|| format!("run {}", bin.display()))?;
-    if !status.success() {
-        return Err(anyhow!("command failed: {} {:?}", bin.display(), args));
+    let output = CommandRunOutput {
+        status: output.status,
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    };
+    emit_command_output(log, step_label, &output);
+    if !output.status.success() {
+        let reason = command_failure_message(step_label, &output);
+        log.error(&reason);
+        return Err(anyhow!(reason));
     }
     Ok(())
 }
 
 fn launch_inspection_shell(cwd: &std::path::Path) -> Result<()> {
-    eprintln!(
-        "pnpm-rs-pre-scan: opening inspection shell in {} (exit the shell to clean up the temp project)",
+    println!(
+        "  [+] opening inspection shell in {} (exit the shell to clean up the temp project)",
         cwd.display()
     );
     let mut cmd = Command::new("/bin/sh");
@@ -698,10 +1198,10 @@ fn relative_path_between(from: &std::path::Path, to: &std::path::Path) -> Option
 #[cfg(test)]
 mod tests {
     use super::{
-        aggregate_scan_results, artifact_dir_name, build_add_args, copy_tree,
+        aggregate_scan_results, artifact_dir_name, build_add_args, copy_tree, maintainer_selector,
         normalize_scan_summary_paths, relative_path_between, sanitize_artifact_component,
-        wildcard_scope_prefix, PackageScanOutcome, SecurityScanSummary, SecurityScanYaraMatch,
-        SecurityScanYaraSummary,
+        wildcard_scope_prefix, PackageLog, PackageScanOutcome, ScanFailure, SecurityScanSummary,
+        SecurityScanYaraMatch, SecurityScanYaraSummary,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -746,6 +1246,51 @@ mod tests {
             "/out",
         ]);
         assert_eq!(cli.out_dir.unwrap(), std::path::PathBuf::from("/out"));
+    }
+
+    #[test]
+    fn cli_accepts_jobs_flag() {
+        let cli = <super::Cli as clap::Parser>::parse_from([
+            "pnpm-rs-pre-scan",
+            "@opengov/*",
+            "--no-deps",
+            "--jobs",
+            "4",
+        ]);
+        assert_eq!(cli.package, "@opengov/*");
+        assert!(cli.no_deps);
+        assert_eq!(cli.jobs, 4);
+    }
+
+    #[test]
+    fn maintainer_selector_accepts_prefixed_username() {
+        assert_eq!(
+            maintainer_selector("maintainer:opengov-superadmin").as_deref(),
+            Some("opengov-superadmin")
+        );
+    }
+
+    #[test]
+    fn maintainer_selector_accepts_profile_shorthand_and_url() {
+        assert_eq!(
+            maintainer_selector("~opengov-superadmin").as_deref(),
+            Some("opengov-superadmin")
+        );
+        assert_eq!(
+            maintainer_selector("https://www.npmjs.com/~opengov-superadmin").as_deref(),
+            Some("opengov-superadmin")
+        );
+        assert_eq!(
+            maintainer_selector("https://www.npmjs.com/~opengov-superadmin/").as_deref(),
+            Some("opengov-superadmin")
+        );
+    }
+
+    #[test]
+    fn maintainer_selector_rejects_invalid_values() {
+        assert!(maintainer_selector("@opengov/*").is_none());
+        assert!(maintainer_selector("maintainer:OpenGov").is_none());
+        assert!(maintainer_selector("https://example.com/~opengov-superadmin").is_none());
     }
 
     #[test]
@@ -906,6 +1451,7 @@ mod tests {
                         ],
                     }),
                 },
+                log: PackageLog::default(),
             },
             PackageScanOutcome {
                 package: "@scope/b".to_string(),
@@ -922,10 +1468,18 @@ mod tests {
                         match_locations: Vec::new(),
                     }),
                 },
+                log: PackageLog::default(),
             },
         ];
 
-        let summary = aggregate_scan_results(&results, &["@scope/c".to_string()]);
+        let summary = aggregate_scan_results(
+            &results,
+            &[ScanFailure {
+                package: "@scope/c".to_string(),
+                error: "install target package failed".to_string(),
+                log: PackageLog::default(),
+            }],
+        );
 
         assert_eq!(summary.successful_scans, 2);
         assert_eq!(summary.failed_scans, 1);
