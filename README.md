@@ -61,6 +61,7 @@ make safety-check PACKAGE='@opengov/*' YARA=rules.yar NO_DEPS=1
 
 The `safety-check` target builds a Docker image containing `pnpm-rs` and `pnpm-rs-pre-scan`, then runs the scan inside a constrained container with a read-only root filesystem, dropped capabilities, and a tmpfs-backed `/tmp`.
 The binaries are built inside the Docker image, so the scan path does not depend on host-compiled artifacts.
+The container runs with the calling host UID/GID so exported `OUT_DIR` artifacts are written back with the same user permissions as the caller.
 Set `NO_DEPS=1` for a faster fetch-only analysis of just the named package; transitive dependencies are not downloaded in that mode.
 For scope wildcard scans such as `@scope/*`, `NO_DEPS=1` is required and you should quote the package pattern or pass it as `PACKAGE='@scope/*'`.
 Set `INSPECT=1` to drop into `/bin/sh` inside the same temp project after the scan completes so you can inspect `package.json`, extracted files, and `node_modules` before the temp directory is cleaned up.

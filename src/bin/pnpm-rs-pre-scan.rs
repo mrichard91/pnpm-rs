@@ -558,9 +558,18 @@ fn sanitize_artifact_component(value: &str) -> String {
 }
 
 fn copy_tree(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
+    copy_tree_with_roots(src, dst, src, dst)
+}
+
+fn copy_tree_with_roots(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    src_root: &std::path::Path,
+    dst_root: &std::path::Path,
+) -> Result<()> {
     let metadata = fs::symlink_metadata(src).with_context(|| format!("stat {}", src.display()))?;
     if metadata.file_type().is_symlink() {
-        copy_symlink(src, dst)?;
+        copy_symlink(src, dst, src_root, dst_root)?;
         return Ok(());
     }
     if metadata.is_dir() {
@@ -569,7 +578,7 @@ fn copy_tree(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
             let entry = entry?;
             let child_src = entry.path();
             let child_dst = dst.join(entry.file_name());
-            copy_tree(&child_src, &child_dst)?;
+            copy_tree_with_roots(&child_src, &child_dst, src_root, dst_root)?;
         }
         return Ok(());
     }
@@ -587,31 +596,115 @@ fn copy_tree(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn copy_symlink(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
+fn copy_symlink(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    src_root: &std::path::Path,
+    dst_root: &std::path::Path,
+) -> Result<()> {
     use std::os::unix::fs::symlink;
 
     if let Some(parent) = dst.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     let target = fs::read_link(src).with_context(|| format!("read link {}", src.display()))?;
+    let target = rewrite_exported_symlink_target(&target, dst, src_root, dst_root);
     symlink(&target, dst).with_context(|| format!("symlink {}", dst.display()))?;
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn copy_symlink(_src: &std::path::Path, _dst: &std::path::Path) -> Result<()> {
+fn copy_symlink(
+    _src: &std::path::Path,
+    _dst: &std::path::Path,
+    _src_root: &std::path::Path,
+    _dst_root: &std::path::Path,
+) -> Result<()> {
     Err(anyhow!("copying symlinks is only supported on unix"))
+}
+
+#[cfg(unix)]
+fn rewrite_exported_symlink_target(
+    target: &std::path::Path,
+    dst: &std::path::Path,
+    src_root: &std::path::Path,
+    dst_root: &std::path::Path,
+) -> PathBuf {
+    if !target.is_absolute() {
+        return target.to_path_buf();
+    }
+    let Ok(relative_target) = target.strip_prefix(src_root) else {
+        return target.to_path_buf();
+    };
+    let remapped_target = dst_root.join(relative_target);
+    let Some(dst_parent) = dst.parent() else {
+        return remapped_target;
+    };
+    relative_path_between(dst_parent, &remapped_target).unwrap_or(remapped_target)
+}
+
+#[cfg(not(unix))]
+fn rewrite_exported_symlink_target(
+    target: &std::path::Path,
+    _dst: &std::path::Path,
+    _src_root: &std::path::Path,
+    _dst_root: &std::path::Path,
+) -> PathBuf {
+    target.to_path_buf()
+}
+
+fn relative_path_between(from: &std::path::Path, to: &std::path::Path) -> Option<PathBuf> {
+    use std::path::Component;
+
+    let from_components = from.components().collect::<Vec<_>>();
+    let to_components = to.components().collect::<Vec<_>>();
+
+    if from_components.is_empty() || to_components.is_empty() {
+        return None;
+    }
+    match (from_components.first(), to_components.first()) {
+        (Some(Component::Prefix(left)), Some(Component::Prefix(right)))
+            if left.kind() != right.kind() =>
+        {
+            return None;
+        }
+        (Some(Component::RootDir), Some(Component::RootDir)) => {}
+        (Some(Component::Normal(_)), Some(Component::Normal(_))) => {}
+        (left, right) if left != right => return None,
+        _ => {}
+    }
+
+    let shared = from_components
+        .iter()
+        .zip(&to_components)
+        .take_while(|(left, right)| left == right)
+        .count();
+
+    let mut out = PathBuf::new();
+    for component in &from_components[shared..] {
+        if matches!(component, Component::Normal(_)) {
+            out.push("..");
+        }
+    }
+    for component in &to_components[shared..] {
+        out.push(component.as_os_str());
+    }
+    if out.as_os_str().is_empty() {
+        out.push(".");
+    }
+    Some(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         aggregate_scan_results, artifact_dir_name, build_add_args, copy_tree,
-        normalize_scan_summary_paths, sanitize_artifact_component, wildcard_scope_prefix,
-        PackageScanOutcome, SecurityScanSummary, SecurityScanYaraMatch, SecurityScanYaraSummary,
+        normalize_scan_summary_paths, relative_path_between, sanitize_artifact_component,
+        wildcard_scope_prefix, PackageScanOutcome, SecurityScanSummary, SecurityScanYaraMatch,
+        SecurityScanYaraSummary,
     };
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn build_add_args_includes_no_deps_flag() {
@@ -705,6 +798,26 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn copy_tree_rewrites_absolute_in_tree_symlinks() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+
+        fs::create_dir_all(src.path().join("dir")).unwrap();
+        let target_file = src.path().join("dir").join("file.txt");
+        fs::write(&target_file, "hello").unwrap();
+        std::os::unix::fs::symlink(&target_file, src.path().join("abs-link.txt")).unwrap();
+
+        let exported = dst.path().join("saved");
+        copy_tree(src.path(), &exported).unwrap();
+
+        let link_path = exported.join("abs-link.txt");
+        let raw_target = fs::read_link(&link_path).unwrap();
+        assert!(!raw_target.is_absolute());
+        assert_eq!(fs::read_to_string(&link_path).unwrap(), "hello");
+    }
+
+    #[test]
     fn wildcard_scope_prefix_accepts_scoped_wildcard() {
         assert_eq!(
             wildcard_scope_prefix("@opengov/*").as_deref(),
@@ -731,6 +844,16 @@ mod tests {
         assert!(wildcard_scope_prefix("@OpenGov/*").is_none());
         assert!(wildcard_scope_prefix("@_hidden/*").is_none());
         assert!(wildcard_scope_prefix("@scope/name/*").is_none());
+    }
+
+    #[test]
+    fn relative_path_between_builds_expected_relative_target() {
+        let from = PathBuf::from("/tmp/out/node_modules/@scope");
+        let to = PathBuf::from("/tmp/out/node_modules/.pnpm/pkg/node_modules/@scope/pkg");
+        assert_eq!(
+            relative_path_between(&from, &to).unwrap(),
+            PathBuf::from("../.pnpm/pkg/node_modules/@scope/pkg")
+        );
     }
 
     #[test]

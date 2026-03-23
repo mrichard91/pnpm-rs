@@ -1,6 +1,8 @@
 SHELL := /bin/bash
 
 SAFETY_CHECK_IMAGE ?= pnpm-rs-safety-check
+HOST_UID := $(shell id -u)
+HOST_GID := $(shell id -g)
 OLDER_THAN_YEARS ?= 5
 YARA ?=
 NO_DEPS ?= 0
@@ -32,6 +34,8 @@ safety-check: safety-check-image
 	@if [[ -n "$(OUT_DIR)" ]]; then mkdir -p "$(OUT_DIR)"; fi
 	@docker run --rm \
 		$(if $(filter 1 true yes on,$(INSPECT)),-it,) \
+		--user "$(HOST_UID):$(HOST_GID)" \
+		-e HOME=/tmp \
 		--cap-drop ALL \
 		--security-opt no-new-privileges \
 		--pids-limit 256 \
